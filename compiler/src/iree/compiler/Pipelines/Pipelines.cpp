@@ -273,6 +273,10 @@ void buildIREEPrecompileTransformPassPipeline(
       }
       GlobalOptimization::buildGlobalOptimizationPassPipeline(
           passManager, globalTransformOptions);
+      if (hooks.pipelineExtensions) {
+        hooks.pipelineExtensions->extendPostGlobalOptimizationPassPipeline(
+            passManager);
+      }
       if (hooks.afterPhase) {
         hooks.afterPhase(IREEVMPipelinePhase::GlobalOptimization, passManager);
       }
