@@ -423,6 +423,7 @@ iree_cc_library(
     "threading_darwin.c"
     "threading_impl.h"
     "threading_pthreads.c"
+    "threading_zephyr.c"
     "threading_win32.c"
   DEPS
     ${CMAKE_DL_LIBS}

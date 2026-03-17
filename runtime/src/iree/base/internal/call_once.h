@@ -83,7 +83,11 @@ static inline void iree_call_once(iree_once_flag* flag, void (*func)(void)) {}
 // Fallback using pthread_once:
 // https://pubs.opengroup.org/onlinepubs/007908775/xsh/pthread_once.html
 
+#if defined(IREE_PLATFORM_ZEPHYR)
+#include <zephyr/posix/pthread.h>
+#else
 #include <pthread.h>
+#endif  // IREE_PLATFORM_ZEPHYR
 
 // Expands to a value that can be used to initialize an object of type
 // iree_once_flag.

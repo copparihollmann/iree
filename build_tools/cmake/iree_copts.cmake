@@ -367,6 +367,16 @@ if(NOT ANDROID AND IREE_ENABLE_THREADING)
   set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
   set(THREADS_PREFER_PTHREAD_FLAG TRUE)
   find_package(Threads)
+  if(NOT Threads_FOUND OR NOT TARGET Threads::Threads)
+    # When cross-compiling for freestanding/bare-metal environments (for example
+    # Zephyr), CMake's FindThreads module may not be able to locate a host
+    # thread library even if the final application provides pthread symbols.
+    #
+    # Provide an empty interface target so IREE targets can express the
+    # dependency without forcing host-side thread library discovery.
+    add_library(Threads::Threads INTERFACE IMPORTED)
+    set(Threads_FOUND TRUE)
+  endif()
   set(IREE_THREADS_DEPS Threads::Threads)
 else()
   # Android provides its own pthreads support with no linking required.

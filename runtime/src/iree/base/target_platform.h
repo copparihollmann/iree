@@ -213,6 +213,13 @@ enum iree_arch_enum_e {
 // IREE_PLATFORM_*
 //==============================================================================
 
+// Zephyr is a freestanding/bare-metal environment and should not pick up host
+// OS platform behaviors (like Linux syscalls for futex/hwprobe).
+// Treat it as "generic" unless the build system explicitly overrides.
+#if defined(__ZEPHYR__) && !defined(IREE_PLATFORM_GENERIC)
+#define IREE_PLATFORM_GENERIC 1
+#endif  // __ZEPHYR__
+
 // We allow IREE_PLATFORM_GENERIC to override all other platform detection
 // logic so that we can purposefully compile for bare-metal devices using a
 // target-specific toolchain (since most of our code should be using these

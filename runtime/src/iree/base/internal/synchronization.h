@@ -65,9 +65,12 @@
 #include <os/lock.h>
 #endif  // IREE_PLATFORM_APPLE
 
-#if !defined(IREE_PLATFORM_WINDOWS)
+#if defined(IREE_PLATFORM_ZEPHYR)
+// Zephyr provides pthread APIs under zephyr/posix.
+#include <zephyr/posix/pthread.h>
+#elif !defined(IREE_PLATFORM_WINDOWS)
 #include <pthread.h>
-#endif  // !IREE_PLATFORM_WINDOWS
+#endif  // IREE_PLATFORM_ZEPHYR / !IREE_PLATFORM_WINDOWS
 
 // We have the CRITICAL_SECTION path for now but Slim Reader/Writer lock (SRW)
 // is much better (and what std::mutex uses). SRW doesn't spin, though, and has
