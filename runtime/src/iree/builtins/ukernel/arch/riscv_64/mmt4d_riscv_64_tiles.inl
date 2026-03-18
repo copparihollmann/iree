@@ -24,17 +24,22 @@ IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 1, 8, _xsmtvdot)
 IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 2, 8, _xsmtvdot)
 IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 4, 8, _xsmtvdot)
 
-// Saturn OPU: keep K0=1 fallback and prefer high-K K0=128 kernels.
-IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 1, 1, _xopu)
-IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 2, 1, _xopu)
-IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 4, 1, _xopu)
-IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 8, 1, _xopu)
-IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 16, 1, _xopu)
-IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 1, 128, _xopu)
-IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 2, 128, _xopu)
-IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 4, 128, _xopu)
-IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 8, 128, _xopu)
-IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 16, 128, _xopu)
+// SpacemiT xsmtvdot FP8: vfmadot (f8E4M3FN x f8E4M3FN -> f16).
+IREE_UK_MMT4D_TILE(riscv_64, f8e4m3, f8e4m3, f16, 4, 8, _xsmtvdot)
+
+// Saturn OPU int8: K0=16 for cache-friendly strided loads (stride=16=1 cache line).
+IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 1, 16, _xopu)
+IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 2, 16, _xopu)
+IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 4, 16, _xopu)
+IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 8, 16, _xopu)
+IREE_UK_MMT4D_TILE(riscv_64, s8, s8, s32, 16, 16, _xopu)
+
+// Saturn OPU FP8: OPFMACC (f8E4M3FN x f8E4M3FN -> f32 accumulation).
+IREE_UK_MMT4D_TILE(riscv_64, f8e4m3, f8e4m3, f32, 1, 16, _xopu)
+IREE_UK_MMT4D_TILE(riscv_64, f8e4m3, f8e4m3, f32, 2, 16, _xopu)
+IREE_UK_MMT4D_TILE(riscv_64, f8e4m3, f8e4m3, f32, 4, 16, _xopu)
+IREE_UK_MMT4D_TILE(riscv_64, f8e4m3, f8e4m3, f32, 8, 16, _xopu)
+IREE_UK_MMT4D_TILE(riscv_64, f8e4m3, f8e4m3, f32, 16, 16, _xopu)
 
 IREE_UK_MMT4D_TILE(riscv_64, f16, f16, f32, 1, 1, _zvfhmin)
 IREE_UK_MMT4D_TILE(riscv_64, f16, f16, f32, 2, 1, _zvfhmin)
