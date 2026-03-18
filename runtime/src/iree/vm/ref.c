@@ -6,6 +6,7 @@
 
 #include "iree/vm/ref.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "iree/base/internal/atomics.h"
@@ -257,20 +258,51 @@ IREE_API_EXPORT void iree_vm_ref_assign(iree_vm_ref_t* ref,
   IREE_VM_REF_ASSERT(out_ref);
 
   // NOTE: ref and out_ref may alias.
+#ifdef IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+  // Safe unaligned read: copy byte-by-byte.
+  iree_vm_ref_t src_ref;
+  const uint8_t* src_bytes = (const uint8_t*)ref;
+  uint8_t* dst_bytes = (uint8_t*)&src_ref;
+  for (int i = 0; i < (int)sizeof(iree_vm_ref_t); ++i) {
+    dst_bytes[i] = src_bytes[i];
+  }
+#else
   iree_vm_ref_t src_ref = *ref;
+#endif
+
   if (ref == out_ref) {
     // Source == target; ignore entirely.
     return;
   }
 
+#ifdef IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+  // Safe unaligned read: copy byte-by-byte.
+  iree_vm_ref_t dst_ref;
+  src_bytes = (const uint8_t*)out_ref;
+  dst_bytes = (uint8_t*)&dst_ref;
+  for (int i = 0; i < (int)sizeof(iree_vm_ref_t); ++i) {
+    dst_bytes[i] = src_bytes[i];
+  }
+#else
   iree_vm_ref_t dst_ref = *out_ref;
+#endif
+
   if (dst_ref.ptr != NULL) {
     // Release existing value.
     iree_vm_ref_release(&dst_ref);
   }
 
   // Assign ref to out_ref (without incrementing counter).
+#ifdef IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+  // Safe unaligned write: copy byte-by-byte.
+  src_bytes = (const uint8_t*)&src_ref;
+  dst_bytes = (uint8_t*)out_ref;
+  for (int i = 0; i < (int)sizeof(iree_vm_ref_t); ++i) {
+    dst_bytes[i] = src_bytes[i];
+  }
+#else
   *out_ref = src_ref;
+#endif
 }
 
 IREE_API_EXPORT void iree_vm_ref_move(iree_vm_ref_t* ref,
