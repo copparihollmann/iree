@@ -212,6 +212,18 @@ matchDAGForUKernel(RewriterBase &rewriter, linalg::Mmt4DOp op,
   } else if (lhsElemType.isBF16() && rhsElemType.isBF16() &&
              outElemType.isBF16()) {
     flags = IREE_UK_FLAG_MMT4D_TYPE_BF16BF16BF16;
+  } else if (isa<FloatType>(lhsElemType) &&
+             lhsElemType.getIntOrFloatBitWidth() == 8 &&
+             isa<FloatType>(rhsElemType) &&
+             rhsElemType.getIntOrFloatBitWidth() == 8 &&
+             outElemType.isF16()) {
+    flags = IREE_UK_FLAG_MMT4D_TYPE_F8E4M3F8E4M3F16;
+  } else if (isa<FloatType>(lhsElemType) &&
+             lhsElemType.getIntOrFloatBitWidth() == 8 &&
+             isa<FloatType>(rhsElemType) &&
+             rhsElemType.getIntOrFloatBitWidth() == 8 &&
+             outElemType.isF32()) {
+    flags = IREE_UK_FLAG_MMT4D_TYPE_F8E4M3F8E4M3F32;
   } else {
     return rewriter.notifyMatchFailure(
         op, "unsupported combination of element types");
@@ -504,6 +516,14 @@ getFlagForUserAndOperandTypes(IREE::Encoding::EncodingAttr encoding,
   } else if (lhs.isSignlessInteger(8) && rhs.isSignlessInteger(8) &&
              out.isSignlessInteger(32)) {
     return IREE_UK_FLAG_QUERY_TILE_SIZES_OPERATION_MATMUL_I8I8I32;
+  } else if (isa<FloatType>(lhs) && lhs.getIntOrFloatBitWidth() == 8 &&
+             isa<FloatType>(rhs) && rhs.getIntOrFloatBitWidth() == 8 &&
+             out.isF16()) {
+    return IREE_UK_FLAG_QUERY_TILE_SIZES_OPERATION_MATMUL_F8E4M3F8E4M3F16;
+  } else if (isa<FloatType>(lhs) && lhs.getIntOrFloatBitWidth() == 8 &&
+             isa<FloatType>(rhs) && rhs.getIntOrFloatBitWidth() == 8 &&
+             out.isF32()) {
+    return IREE_UK_FLAG_QUERY_TILE_SIZES_OPERATION_MATMUL_F8E4M3F8E4M3F32;
   } else {
     return IREE_UK_FLAG_QUERY_TILE_SIZES_OPERATION_NONE;
   }
