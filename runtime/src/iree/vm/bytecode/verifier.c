@@ -6,6 +6,9 @@
 
 #include "iree/vm/bytecode/verifier.h"
 
+#include <stdint.h>
+#include <stdio.h>
+
 #include "iree/base/internal/math.h"
 #include "iree/vm/bytecode/utils/block_list.h"
 #include "iree/vm/bytecode/utils/features.h"
@@ -445,13 +448,15 @@ iree_status_t iree_vm_bytecode_function_verify(
 
 // Bails if the |pc| exceeds the |max_pc|.
 #define IREE_VM_VERIFY_PC_RANGE(pc, max_pc)                                  \
-  if (IREE_UNLIKELY((pc) > (max_pc))) {                                      \
-    return iree_make_status(IREE_STATUS_OUT_OF_RANGE,                        \
+  do {                                                                        \
+    if (IREE_UNLIKELY((pc) > (max_pc))) {                                    \
+      return iree_make_status(IREE_STATUS_OUT_OF_RANGE,                      \
                             "bytecode data overrun trying to parsing op at " \
                             "%08X (%u) of %u available bytes",               \
-                            (uint32_t)(pc), (uint32_t)(pc),                  \
-                            (uint32_t)(max_pc));                             \
-  }
+                              (uint32_t)(pc), (uint32_t)(pc),                \
+                              (uint32_t)(max_pc));                           \
+    }                                                                         \
+  } while (0)
 
 // Bails if the function doesn't have the given |required_features| declared.
 #define IREE_VM_VERIFY_REQUIREMENT(required_features)                         \
@@ -1023,7 +1028,8 @@ static iree_status_t iree_vm_bytecode_function_verify_bytecode_op(
   }
 
   // Get primary opcode. All ops have at least 1 byte.
-  switch (bytecode_data[pc++]) {
+  uint8_t opcode = bytecode_data[pc++];
+  switch (opcode) {
     //===------------------------------------------------------------------===//
     // Globals
     //===------------------------------------------------------------------===//

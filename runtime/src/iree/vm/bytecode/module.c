@@ -8,6 +8,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "iree/vm/bytecode/archive.h"
@@ -847,8 +848,14 @@ static iree_status_t iree_vm_bytecode_module_begin_call(
   iree_vm_bytecode_module_t* module = (iree_vm_bytecode_module_t*)self;
   uint16_t internal_ordinal = 0;
   iree_vm_FunctionSignatureDef_table_t signature_def = NULL;
+#ifdef IREE_PLATFORM_GENERIC
+  iree_status_t status = iree_vm_bytecode_map_internal_ordinal(
+      module, call.function, &internal_ordinal, &signature_def);
+  if (!iree_status_is_ok(status)) { return status; }
+#else
   IREE_RETURN_IF_ERROR(iree_vm_bytecode_map_internal_ordinal(
       module, call.function, &internal_ordinal, &signature_def));
+#endif
 
   call.function.linkage = IREE_VM_FUNCTION_LINKAGE_INTERNAL;
   call.function.ordinal = internal_ordinal;
@@ -873,13 +880,25 @@ static iree_status_t iree_vm_bytecode_module_begin_call(
       flatbuffers_string_len(calling_convention);
   iree_string_view_t cconv_arguments = iree_string_view_empty();
   iree_string_view_t cconv_results = iree_string_view_empty();
+#ifdef IREE_PLATFORM_GENERIC
+  status = iree_vm_function_call_get_cconv_fragments(
+      &signature, &cconv_arguments, &cconv_results);
+  if (!iree_status_is_ok(status)) { return status; }
+#else
   IREE_RETURN_IF_ERROR(iree_vm_function_call_get_cconv_fragments(
       &signature, &cconv_arguments, &cconv_results));
+#endif
 
   // Jump into the dispatch routine to execute bytecode until the function
   // either returns (synchronous) or yields (asynchronous).
+#ifdef IREE_PLATFORM_GENERIC
+  status = iree_vm_bytecode_dispatch_begin(stack, module, call, cconv_arguments,
+                                           cconv_results);
+  return status;
+#else
   return iree_vm_bytecode_dispatch_begin(stack, module, call, cconv_arguments,
                                          cconv_results);  // tail
+#endif
 }
 
 static iree_status_t iree_vm_bytecode_module_resume_call(
@@ -1030,7 +1049,7 @@ IREE_API_EXPORT iree_status_t iree_vm_bytecode_module_create(
     IREE_TRACE_ZONE_BEGIN_NAMED(z1, "iree_vm_bytecode_function_verify");
     verify_status = iree_vm_bytecode_function_verify(module, i, allocator);
     IREE_TRACE_ZONE_END(z1);
-    if (!iree_status_is_ok(verify_status)) break;
+    if (!iree_status_is_ok(verify_status)) { break; }
   }
 #endif  // IREE_VM_BYTECODE_VERIFICATION_ENABLE
   if (iree_status_is_ok(verify_status)) {

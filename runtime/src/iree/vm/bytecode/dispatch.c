@@ -6,6 +6,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "iree/base/api.h"
@@ -203,9 +204,18 @@ static iree_status_t iree_vm_bytecode_function_enter(
   IREE_ASSERT_ALIGNED(frame_size, sizeof(iree_max_align_t));
 
   // Enter function and allocate stack frame storage.
+#ifdef IREE_PLATFORM_GENERIC
+  iree_status_t status = iree_vm_stack_function_enter(
+      stack, &function, IREE_VM_STACK_FRAME_BYTECODE, frame_size,
+      iree_vm_bytecode_stack_frame_cleanup, out_callee_frame);
+  if (!iree_status_is_ok(status)) {
+    return status;
+  }
+#else
   IREE_RETURN_IF_ERROR(iree_vm_stack_function_enter(
       stack, &function, IREE_VM_STACK_FRAME_BYTECODE, frame_size,
       iree_vm_bytecode_stack_frame_cleanup, out_callee_frame));
+#endif
 
   // Stash metadata and compute register pointers.
   iree_vm_bytecode_frame_storage_t* stack_storage =
@@ -248,8 +258,16 @@ static iree_status_t iree_vm_bytecode_external_enter(
     iree_vm_stack_frame_t * IREE_RESTRICT * out_callee_frame,
     iree_vm_registers_t* out_callee_registers) {
   // Enter the bytecode function and allocate registers.
+#ifdef IREE_PLATFORM_GENERIC
+  iree_status_t status = iree_vm_bytecode_function_enter(
+      stack, function, cconv_results, out_callee_frame, out_callee_registers);
+  if (!iree_status_is_ok(status)) {
+    return status;
+  }
+#else
   IREE_RETURN_IF_ERROR(iree_vm_bytecode_function_enter(
       stack, function, cconv_results, out_callee_frame, out_callee_registers));
+#endif
 
   // Marshal arguments from the ABI format to the VM registers.
   iree_vm_registers_t callee_registers = *out_callee_registers;
@@ -263,7 +281,16 @@ static iree_status_t iree_vm_bytecode_external_enter(
       case IREE_VM_CCONV_TYPE_I32:
       case IREE_VM_CCONV_TYPE_F32: {
         uint16_t dst_reg = i32_reg++;
+#ifdef IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+        const uint8_t* src = (const uint8_t*)p;
+        uint8_t* dst = (uint8_t*)&callee_registers.i32[dst_reg];
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = src[3];
+#else
         memcpy(&callee_registers.i32[dst_reg], p, sizeof(int32_t));
+#endif
         p += sizeof(int32_t);
       } break;
       case IREE_VM_CCONV_TYPE_I64:
@@ -272,7 +299,20 @@ static iree_status_t iree_vm_bytecode_external_enter(
         i32_reg = iree_host_align(i32_reg, 2);  // ensure aligned
         uint16_t dst_reg = i32_reg;
         i32_reg += 2;
+#ifdef IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+        const uint8_t* src = (const uint8_t*)p;
+        uint8_t* dst = (uint8_t*)&callee_registers.i32[dst_reg];
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = src[3];
+        dst[4] = src[4];
+        dst[5] = src[5];
+        dst[6] = src[6];
+        dst[7] = src[7];
+#else
         memcpy(&callee_registers.i32[dst_reg], p, sizeof(int64_t));
+#endif
         p += sizeof(int64_t);
       } break;
       case IREE_VM_CCONV_TYPE_REF: {
@@ -314,13 +354,35 @@ static iree_status_t iree_vm_bytecode_external_leave(
         break;
       case IREE_VM_CCONV_TYPE_I32:
       case IREE_VM_CCONV_TYPE_F32: {
+#ifdef IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+        const uint8_t* src = (const uint8_t*)&callee_registers->i32[src_reg];
+        uint8_t* dst = (uint8_t*)p;
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = src[3];
+#else
         memcpy(p, &callee_registers->i32[src_reg], sizeof(int32_t));
+#endif
         p += sizeof(int32_t);
       } break;
       case IREE_VM_CCONV_TYPE_I64:
       case IREE_VM_CCONV_TYPE_F64: {
         p = iree_vm_bytecode_align_ptr(p, sizeof(int64_t));
+#ifdef IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+        const uint8_t* src = (const uint8_t*)&callee_registers->i32[src_reg];
+        uint8_t* dst = (uint8_t*)p;
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = src[3];
+        dst[4] = src[4];
+        dst[5] = src[5];
+        dst[6] = src[6];
+        dst[7] = src[7];
+#else
         memcpy(p, &callee_registers->i32[src_reg], sizeof(int64_t));
+#endif
         p += sizeof(int64_t);
       } break;
       case IREE_VM_CCONV_TYPE_REF: {
@@ -481,15 +543,37 @@ static void iree_vm_bytecode_populate_import_cconv_arguments(
         break;
       case IREE_VM_CCONV_TYPE_I32:
       case IREE_VM_CCONV_TYPE_F32: {
+#ifdef IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+        const uint8_t* src =
+            (const uint8_t*)&caller_registers.i32[src_reg_list->registers[reg_i++]];
+        p[0] = src[0];
+        p[1] = src[1];
+        p[2] = src[2];
+        p[3] = src[3];
+#else
         memcpy(p, &caller_registers.i32[src_reg_list->registers[reg_i++]],
                sizeof(int32_t));
+#endif
         p += sizeof(int32_t);
       } break;
       case IREE_VM_CCONV_TYPE_I64:
       case IREE_VM_CCONV_TYPE_F64: {
         p = iree_vm_bytecode_align_ptr(p, sizeof(int64_t));
+#ifdef IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+        const uint8_t* src =
+            (const uint8_t*)&caller_registers.i32[src_reg_list->registers[reg_i++]];
+        p[0] = src[0];
+        p[1] = src[1];
+        p[2] = src[2];
+        p[3] = src[3];
+        p[4] = src[4];
+        p[5] = src[5];
+        p[6] = src[6];
+        p[7] = src[7];
+#else
         memcpy(p, &caller_registers.i32[src_reg_list->registers[reg_i++]],
                sizeof(int64_t));
+#endif
         p += sizeof(int64_t);
       } break;
       case IREE_VM_CCONV_TYPE_REF: {
@@ -548,17 +632,39 @@ static void iree_vm_bytecode_populate_import_cconv_arguments(
                 break;
               case IREE_VM_CCONV_TYPE_I32:
               case IREE_VM_CCONV_TYPE_F32: {
+#ifdef IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+                const uint8_t* src =
+                    (const uint8_t*)&caller_registers.i32[src_reg_list->registers[reg_i++]];
+                p[0] = src[0];
+                p[1] = src[1];
+                p[2] = src[2];
+                p[3] = src[3];
+#else
                 memcpy(p,
                        &caller_registers.i32[src_reg_list->registers[reg_i++]],
                        sizeof(int32_t));
+#endif
                 p += sizeof(int32_t);
               } break;
               case IREE_VM_CCONV_TYPE_I64:
               case IREE_VM_CCONV_TYPE_F64: {
                 p = iree_vm_bytecode_align_ptr(p, sizeof(int64_t));
+#ifdef IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+                const uint8_t* src =
+                    (const uint8_t*)&caller_registers.i32[src_reg_list->registers[reg_i++]];
+                p[0] = src[0];
+                p[1] = src[1];
+                p[2] = src[2];
+                p[3] = src[3];
+                p[4] = src[4];
+                p[5] = src[5];
+                p[6] = src[6];
+                p[7] = src[7];
+#else
                 memcpy(p,
                        &caller_registers.i32[src_reg_list->registers[reg_i++]],
                        sizeof(int64_t));
+#endif
                 p += sizeof(int64_t);
               } break;
               case IREE_VM_CCONV_TYPE_REF: {
@@ -719,13 +825,39 @@ static iree_status_t iree_vm_bytecode_issue_import_call(
         break;
       case IREE_VM_CCONV_TYPE_I32:
       case IREE_VM_CCONV_TYPE_F32:
+#ifdef IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+        {
+          const uint8_t* src = (const uint8_t*)p;
+          uint8_t* dst = (uint8_t*)&caller_registers.i32[dst_reg];
+          dst[0] = src[0];
+          dst[1] = src[1];
+          dst[2] = src[2];
+          dst[3] = src[3];
+        }
+#else
         memcpy(&caller_registers.i32[dst_reg], p, sizeof(int32_t));
+#endif
         p += sizeof(int32_t);
         break;
       case IREE_VM_CCONV_TYPE_I64:
       case IREE_VM_CCONV_TYPE_F64:
         p = iree_vm_bytecode_align_ptr(p, sizeof(int64_t));
+#ifdef IREE_MEMORY_ACCESS_ALIGNMENT_REQUIRED
+        {
+          const uint8_t* src = (const uint8_t*)p;
+          uint8_t* dst = (uint8_t*)&caller_registers.i32[dst_reg];
+          dst[0] = src[0];
+          dst[1] = src[1];
+          dst[2] = src[2];
+          dst[3] = src[3];
+          dst[4] = src[4];
+          dst[5] = src[5];
+          dst[6] = src[6];
+          dst[7] = src[7];
+        }
+#else
         memcpy(&caller_registers.i32[dst_reg], p, sizeof(int64_t));
+#endif
         p += sizeof(int64_t);
         break;
       case IREE_VM_CCONV_TYPE_REF:
@@ -823,8 +955,16 @@ static iree_status_t iree_vm_bytecode_call_import_variadic(
     iree_vm_registers_t* out_caller_registers) {
   // Prepare |call| by looking up the import information.
   const iree_vm_bytecode_import_t* import = NULL;
+#ifdef IREE_PLATFORM_GENERIC
+  iree_status_t status = iree_vm_bytecode_verify_import(
+      stack, module_state, import_ordinal, &import);
+  if (!iree_status_is_ok(status)) {
+    return status;
+  }
+#else
   IREE_RETURN_IF_ERROR(iree_vm_bytecode_verify_import(stack, module_state,
                                                       import_ordinal, &import));
+#endif
 
   iree_vm_function_call_t call;
   memset(&call, 0, sizeof(call));
@@ -832,8 +972,16 @@ static iree_status_t iree_vm_bytecode_call_import_variadic(
 
   // Allocate ABI argument/result storage taking into account the variadic
   // segments.
+#ifdef IREE_PLATFORM_GENERIC
+  status = iree_vm_function_call_compute_cconv_fragment_size(
+      import->arguments, segment_size_list, &call.arguments.data_length);
+  if (!iree_status_is_ok(status)) {
+    return status;
+  }
+#else
   IREE_RETURN_IF_ERROR(iree_vm_function_call_compute_cconv_fragment_size(
       import->arguments, segment_size_list, &call.arguments.data_length));
+#endif
   call.arguments.data = iree_alloca(call.arguments.data_length);
   memset(call.arguments.data, 0, call.arguments.data_length);
 
@@ -1103,22 +1251,31 @@ iree_status_t iree_vm_bytecode_dispatch_begin(
   // actually does return, either immediately or in the future via a resume.
   iree_vm_stack_frame_t* current_frame = NULL;
   iree_vm_registers_t regs;
+#ifdef IREE_PLATFORM_GENERIC
+  iree_status_t status = iree_vm_bytecode_external_enter(
+      stack, call.function, cconv_arguments, call.arguments, cconv_results,
+      &current_frame, &regs);
+  if (!iree_status_is_ok(status)) {
+    return status;
+  }
+#else
   IREE_RETURN_IF_ERROR(iree_vm_bytecode_external_enter(
       stack, call.function, cconv_arguments, call.arguments, cconv_results,
       &current_frame, &regs));
+#endif
 
-  iree_status_t status = iree_vm_bytecode_dispatch(stack, module, current_frame,
-                                                   regs, call.results);
-  if (!iree_status_is_ok(status) && !iree_status_is_deferred(status)) {
+  iree_status_t status2 = iree_vm_bytecode_dispatch(stack, module, current_frame,
+                                                    regs, call.results);
+  if (!iree_status_is_ok(status2) && !iree_status_is_deferred(status2)) {
     // Mark as error path so frame cleanup releases refs.
     iree_vm_bytecode_frame_storage_t* stack_storage =
         (iree_vm_bytecode_frame_storage_t*)iree_vm_stack_frame_storage(
             current_frame);
-    stack_storage->result_code = iree_status_code(status);
+    stack_storage->result_code = iree_status_code(status2);
     // Balance the external_enter on failure.
     IREE_IGNORE_ERROR(iree_vm_stack_function_leave(stack));
   }
-  return status;
+  return status2;
 }
 
 iree_status_t iree_vm_bytecode_dispatch_resume(
@@ -2171,7 +2328,13 @@ static iree_status_t iree_vm_bytecode_dispatch(
           src_reg_list, dst_reg_list, &current_frame, &regs);
       IREE_ASSERT(!iree_status_is_deferred(call_status),
                   "deferred calls must use vm.call.yieldable");
+#ifdef IREE_PLATFORM_GENERIC
+      if (!iree_status_is_ok(call_status)) {
+        return call_status;
+      }
+#else
       IREE_RETURN_IF_ERROR(call_status);
+#endif
 
       // Restore the local dispatch variables that may have changed during the
       // function call due to stack growth.

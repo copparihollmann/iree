@@ -8,6 +8,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "iree/base/api.h"
@@ -111,31 +112,55 @@ static iree_status_t iree_vm_invoke_marshal_inputs(
         break;
       case IREE_VM_CCONV_TYPE_I32: {
         iree_vm_value_t value;
+#ifdef IREE_PLATFORM_GENERIC
+        iree_status_t status = iree_vm_list_get_value_as(
+            inputs, arg_i, IREE_VM_VALUE_TYPE_I32, &value);
+        if (!iree_status_is_ok(status)) { return status; }
+#else
         IREE_RETURN_IF_ERROR(iree_vm_list_get_value_as(
             inputs, arg_i, IREE_VM_VALUE_TYPE_I32, &value));
+#endif
         memcpy(p, &value.i32, sizeof(int32_t));
         p += sizeof(int32_t);
       } break;
       case IREE_VM_CCONV_TYPE_I64: {
         p = iree_vm_invoke_align_ptr(p, sizeof(int64_t));
         iree_vm_value_t value;
+#ifdef IREE_PLATFORM_GENERIC
+        iree_status_t status = iree_vm_list_get_value_as(
+            inputs, arg_i, IREE_VM_VALUE_TYPE_I64, &value);
+        if (!iree_status_is_ok(status)) { return status; }
+#else
         IREE_RETURN_IF_ERROR(iree_vm_list_get_value_as(
             inputs, arg_i, IREE_VM_VALUE_TYPE_I64, &value));
+#endif
         memcpy(p, &value.i64, sizeof(int64_t));
         p += sizeof(int64_t);
       } break;
       case IREE_VM_CCONV_TYPE_F32: {
         iree_vm_value_t value;
+#ifdef IREE_PLATFORM_GENERIC
+        iree_status_t status = iree_vm_list_get_value_as(
+            inputs, arg_i, IREE_VM_VALUE_TYPE_F32, &value);
+        if (!iree_status_is_ok(status)) { return status; }
+#else
         IREE_RETURN_IF_ERROR(iree_vm_list_get_value_as(
             inputs, arg_i, IREE_VM_VALUE_TYPE_F32, &value));
+#endif
         memcpy(p, &value.f32, sizeof(float));
         p += sizeof(float);
       } break;
       case IREE_VM_CCONV_TYPE_F64: {
         p = iree_vm_invoke_align_ptr(p, sizeof(double));
         iree_vm_value_t value;
+#ifdef IREE_PLATFORM_GENERIC
+        iree_status_t status = iree_vm_list_get_value_as(
+            inputs, arg_i, IREE_VM_VALUE_TYPE_F64, &value);
+        if (!iree_status_is_ok(status)) { return status; }
+#else
         IREE_RETURN_IF_ERROR(iree_vm_list_get_value_as(
             inputs, arg_i, IREE_VM_VALUE_TYPE_F64, &value));
+#endif
         memcpy(p, &value.f64, sizeof(double));
         p += sizeof(double);
       } break;
@@ -145,8 +170,16 @@ static iree_status_t iree_vm_invoke_marshal_inputs(
         // modules that receive refs via ParamUnpack should use borrowed
         // pointers (T*) rather than owned refs (ref<T>) to avoid ownership
         // issues, as ParamUnpack takes ownership and zeros the source.
+#ifdef IREE_PLATFORM_GENERIC
+        {
+          iree_status_t status =
+              iree_vm_list_get_ref_assign(inputs, arg_i, (iree_vm_ref_t*)p);
+          if (!iree_status_is_ok(status)) { return status; }
+        }
+#else
         IREE_RETURN_IF_ERROR(
             iree_vm_list_get_ref_assign(inputs, arg_i, (iree_vm_ref_t*)p));
+#endif
         p += sizeof(iree_vm_ref_t);
       } break;
     }
@@ -411,17 +444,29 @@ IREE_API_EXPORT iree_status_t iree_vm_begin_invoke(
       iree_vm_function_signature(&function);
   iree_string_view_t cconv_arguments = iree_string_view_empty();
   iree_string_view_t cconv_results = iree_string_view_empty();
+#ifdef IREE_PLATFORM_GENERIC
+  iree_status_t status = iree_vm_function_call_get_cconv_fragments(
+      &signature, &cconv_arguments, &cconv_results);
+  if (!iree_status_is_ok(status)) { IREE_TRACE_ZONE_END(z0); return status; }
+#else
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_vm_function_call_get_cconv_fragments(
               &signature, &cconv_arguments, &cconv_results));
+#endif
 
   // Allocate argument storage on the native stack. It only needs to survive the
   // begin call as it's consumed by the invokee.
   iree_byte_span_t arguments = iree_byte_span_empty();
+#ifdef IREE_PLATFORM_GENERIC
+  status = iree_vm_function_call_compute_cconv_fragment_size(
+      cconv_arguments, /*segment_size_list=*/NULL, &arguments.data_length);
+  if (!iree_status_is_ok(status)) { IREE_TRACE_ZONE_END(z0); return status; }
+#else
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0,
       iree_vm_function_call_compute_cconv_fragment_size(
           cconv_arguments, /*segment_size_list=*/NULL, &arguments.data_length));
+#endif
   const bool arguments_on_heap =
       arguments.data_length > IREE_VM_STACK_MAX_ARGUMENT_ALLOCA_SIZE;
   if (!arguments_on_heap) {
@@ -431,9 +476,15 @@ IREE_API_EXPORT iree_status_t iree_vm_begin_invoke(
   } else {
     // Couldn't inline, do a heap allocation that we'll keep until this function
     // returns.
+#ifdef IREE_PLATFORM_GENERIC
+    status = iree_allocator_malloc(host_allocator, arguments.data_length,
+                                   (void**)&arguments.data);
+    if (!iree_status_is_ok(status)) { IREE_TRACE_ZONE_END(z0); return status; }
+#else
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_allocator_malloc(host_allocator, arguments.data_length,
                                   (void**)&arguments.data));
+#endif
   }
   memset(arguments.data, 0, arguments.data_length);
 
@@ -442,10 +493,25 @@ IREE_API_EXPORT iree_status_t iree_vm_begin_invoke(
   // storage. This reduces the overall available stack space but not by much,
   // and if the stack needs to dynamically grow the inlined storage will still
   // be available.
+<<<<<<< HEAD
   iree_byte_span_t results = iree_byte_span_empty();
+=======
+  iree_byte_span_t results = iree_make_byte_span(NULL, 0);
+#ifdef IREE_PLATFORM_GENERIC
+  status = iree_vm_function_call_compute_cconv_fragment_size(
+      cconv_results, /*segment_size_list=*/NULL, &results.data_length);
+  if (!iree_status_is_ok(status)) {
+    iree_vm_invoke_release_argument_storage(cconv_arguments, arguments,
+                                            arguments_on_heap, host_allocator);
+    IREE_TRACE_ZONE_END(z0);
+    return status;
+  }
+#else
+>>>>>>> 2b7dd40a5a ([Bare-metal] [Runtime] Conditional build for bare-metal implementation in the runtime)
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_vm_function_call_compute_cconv_fragment_size(
               cconv_results, /*segment_size_list=*/NULL, &results.data_length));
+#endif
   iree_host_size_t reserved_storage_size = 0;
   if (results.data_length <= sizeof(state->stack_storage) / 4) {
     // Results fit in the inlined storage and we can avoid a heap allocation.
@@ -456,9 +522,15 @@ IREE_API_EXPORT iree_status_t iree_vm_begin_invoke(
   } else {
     // Couldn't inline, do a heap allocation we'll have to hang on to and
     // clean up when the invocation state is released.
+#ifdef IREE_PLATFORM_GENERIC
+    status = iree_allocator_malloc(host_allocator, results.data_length,
+                                   (void**)&results.data);
+    if (!iree_status_is_ok(status)) { IREE_TRACE_ZONE_END(z0); return status; }
+#else
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_allocator_malloc(host_allocator, results.data_length,
                                   (void**)&results.data));
+#endif
   }
   memset(results.data, 0, results.data_length);
 

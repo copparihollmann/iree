@@ -8,6 +8,7 @@
 #define IREE_VM_BYTECODE_DISPATCH_UTIL_H_
 
 #include <assert.h>
+#include <stdio.h>
 
 #include "iree/base/api.h"
 #include "iree/vm/api.h"
@@ -210,8 +211,10 @@ static inline iree_vm_type_def_t iree_vm_map_type(
 
 #define IREE_VM_ISA_DISPATCH_OP(ext, op_name, body)                       \
   _dispatch_##ext##_##op_name :;                                          \
-  IREE_DISPATCH_TRACE_INSTRUCTION(IREE_VM_ISA_PC_OFFSET_##ext, #op_name); \
-  body;                                                                   \
+  {                                                                       \
+    IREE_DISPATCH_TRACE_INSTRUCTION(IREE_VM_ISA_PC_OFFSET_##ext, #op_name); \
+    body;                                                                 \
+  }                                                                       \
   goto* kDispatchTable_CORE[bytecode_data[pc++]];
 
 #define IREE_VM_ISA_DISPATCH_BEGIN_PREFIX(op_name, ext)                       \
@@ -249,8 +252,10 @@ static inline iree_vm_type_def_t iree_vm_map_type(
 
 #define IREE_VM_ISA_DISPATCH_OP(ext, op_name, body)                         \
   case IREE_VM_OP_##ext##_##op_name: {                                      \
-    IREE_DISPATCH_TRACE_INSTRUCTION(IREE_VM_ISA_PC_OFFSET_##ext, #op_name); \
-    body;                                                                   \
+    {                                                                       \
+      IREE_DISPATCH_TRACE_INSTRUCTION(IREE_VM_ISA_PC_OFFSET_##ext, #op_name); \
+      body;                                                                 \
+    }                                                                       \
   } break;
 
 #define IREE_VM_ISA_DISPATCH_BEGIN_PREFIX(op_name, ext) \
