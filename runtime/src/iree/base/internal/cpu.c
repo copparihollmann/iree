@@ -445,7 +445,16 @@ static void iree_cpu_initialize_from_platform_riscv_64(uint64_t* out_fields) {
 #else
 
 static void iree_cpu_initialize_from_platform_riscv_64(uint64_t* out_fields) {
-  // No implementation available. CPU data will be all zeros.
+  // Bare-metal: no hwprobe/getauxval available for runtime feature detection.
+  // Use compile-time define from the toolchain cmake to set CPU feature bits.
+  // Each hardware target recipe sets IREE_BARE_METAL_CPU_DATA0 to the
+  // appropriate bitmask (e.g., V | XOPU for Saturn OPU).
+#if defined(IREE_BARE_METAL_CPU_DATA0)
+  out_fields[0] = IREE_BARE_METAL_CPU_DATA0;
+#else
+  // Fallback: assume at least base V extension if nothing specified.
+  out_fields[0] = IREE_CPU_DATA0_RISCV_64_V;
+#endif
 }
 
 #endif  // IREE_PLATFORM_*
