@@ -498,24 +498,19 @@ enumerateMatmulTileRiscv64(TypeRange elementTypes, DictionaryAttr config) {
   if (lhs.isSignlessInteger(8) && rhs.isSignlessInteger(8) &&
       out.isSignlessInteger(32)) {
 
-    // Saturn OPU path.
-    // Note: This only makes sense if your lowering actually maps to OPU
-    // (either via custom kernels or a future ukernel). Otherwise it just
-    // influences tile choice.
+    // Saturn OPU: M0=N0=VLEN/2 preferred (64 on V128). K0=1 for
+    // contiguous loads in the ukernel (no encoding swap needed).
     if (hasFeature(config, "+xopu")) {
-      // OPU outer-product unit: 16x16 MAC array with 32-bit accumulators.
-      // K0=16: stride for column loads = K0 = 16 bytes = 1 cache line.
-      // This gives good cache locality while still having 16 VOPACC ops
-      // per inner tile (vs 128 with K0=128 but stride=128).
-      int N0 = std::min<int>(16, vlen / 8);  // e8, m1 lanes
-
+      int N0 = std::min<int>(16, vlen / 8);  // e8, m1 lanes = 16 on V128
       return {
-          TileMxNxK{N0, N0, 16},
-          TileMxNxK{N0 / 2, N0, 16},
-          TileMxNxK{N0 / 4, N0, 16},
-          TileMxNxK{1, N0, 16},
+          TileMxNxK{4 * N0, 4 * N0, 1},  // 64x64: preferred (VLEN/2)
+          TileMxNxK{2 * N0, 2 * N0, 1},  // 32x32: 2x2 tiling
+          TileMxNxK{N0, N0, 1},           // 16x16: 1x1 fallback
+          TileMxNxK{N0 / 2, N0, 1},       // 8x16: narrow-M
+          TileMxNxK{1, N0, 1},            // 1x16: vecmat
       };
     }
+
     if (hasFeature(config, "+xsmtvdot")) {
       // SpacemiT vmadot: fixed 4x4x8 blocks.
       return {
@@ -809,26 +804,6 @@ struct CPUEncodingPackedLayoutMaterializerAttr
       return info;
     }
     info = std::move(maybeEncodingInfo.value());
-
-    // OPU optimization: swap inner K and M/N dims for LHS/RHS operands
-    // to make M/N the fastest-varying (innermost) dimension. This enables
-    // contiguous vector loads (vle8.v) instead of strided loads (vlse8.v),
-    // which is critical on Saturn where strided loads are 1 elem/cycle vs
-    // contiguous at dLen/8 elem/cycle (16x speedup for dLen=128).
-    //
-    // Only applied for +xopu target. The result operand (which has M,N
-    // but no K) is naturally unaffected since we skip it.
-    // outerDimsPerm is NOT swapped — outer tile iteration order must stay
-    // as [M_tiles, K_tiles] for correct mmt4d indexing.
-    if (hasFeature(layoutAttr.getConfiguration(), "+xopu")) {
-      int64_t operandIdx = encoding.getOperandIndex().getInt();
-      if (operandIdx != IREE::Encoding::MATMUL_RESULT &&
-          info.innerDimsPos.size() >= 2) {
-        size_t sz = info.innerDimsPos.size();
-        std::swap(info.innerDimsPos[sz - 2], info.innerDimsPos[sz - 1]);
-        std::swap(info.innerTileSizes[sz - 2], info.innerTileSizes[sz - 1]);
-      }
-    }
 
     FailureOr<IREE::Codegen::ScalableTileFlags> scalableFlags =
         getScalableTileFlags(*cDims, encoding, layoutAttr.getConfiguration());

@@ -655,21 +655,534 @@ iree_uk_mmt4d_tile_s8s8s32_1xXXx16_to_16xXXx16_riscv_64_xopu(
       out_tile, lhs_panel, rhs_panel, params, M0);
 }
 
+// =============================================================================
+// Saturn OPU int8 K0=1 path: uses VOPACC outer-product instructions.
+//
+// With K0=1 the compiler uses the standard RVV tile pipeline (no special
+// packing). params->K equals the full reduction dimension. The OPU
+// advantage comes entirely from using VOPACC instead of vwmul+vwadd.
+// =============================================================================
+
+IREE_UK_ATTRIBUTE_ALWAYS_INLINE static inline void
+iree_uk_mmt4d_tile_s8s8s32_1xXXx1_to_16xXXx1_riscv_64_xopu(
+    void* IREE_UK_RESTRICT out_tile, const void* IREE_UK_RESTRICT lhs_panel,
+    const void* IREE_UK_RESTRICT rhs_panel,
+    const iree_uk_mmt4d_params_t* params, int M0) {
+  IREE_UK_ASSERT(M0 >= 1 && M0 <= 16);
+  iree_uk_int32_t* IREE_UK_RESTRICT out_ptr = out_tile;
+  const iree_uk_int8_t* IREE_UK_RESTRICT lhs_ptr = lhs_panel;
+  const iree_uk_int8_t* IREE_UK_RESTRICT rhs_ptr = rhs_panel;
+
+  const int N0 = params->N0;
+  const int K = params->K;
+  const int HW_WIDTH = 16;
+
+  for (int n_start = 0; n_start < N0; n_start += HW_WIDTH) {
+    int n_rem = N0 - n_start;
+    size_t vl = (n_rem < HW_WIDTH) ? n_rem : HW_WIDTH;
+    size_t ml = M0;
+
+    const iree_uk_int8_t* sub_rhs = rhs_ptr + n_start;
+    iree_uk_int32_t* sub_out = out_ptr + n_start;
+
+    // --- PATH A: High Performance (M0=16) ---
+    if (M0 == 16) {
+      asm volatile("vsetvli zero, %0, e32, m8, ta, ma" : : "r"(vl));
+      asm volatile("vmv.v.i v0, 0" : : : "memory");
+      iree_uk_riscv_64_xopu_opmvinbcast_m0_from_v0();
+
+      if (params->flags & IREE_UK_FLAG_MMT4D_ACCUMULATE) {
+        for (int row = 0; row < 16; ++row) {
+          asm volatile("vle32.v v0, (%0)" : : "r"(&sub_out[row * N0]) : "memory");
+          iree_uk_riscv_64_xopu_vmv_rv_m0_from_v0(row);
+        }
+      }
+
+      // K loop: single asm block per iteration to prevent compiler from
+      // inserting redundant vsetvli. Unrolled by 4 for reduced loop overhead
+      // and better load/compute overlap.
+      const iree_uk_int8_t* lhs_k = lhs_ptr;
+      const iree_uk_int8_t* rhs_k = sub_rhs;
+      size_t k = 0;
+      asm volatile("vsetvli zero, %0, e8, m2, ta, ma" : : "r"(ml));
+      for (; k + 4 <= (size_t)K; k += 4) {
+        asm volatile(
+            "vle8.v v16, (%0)\n\t"
+            "vle8.v v18, (%1)\n\t"
+            ".insn r 0x57, 0x2, 0x51, x0, x18, x16\n\t"
+            "vle8.v v20, (%2)\n\t"
+            "vle8.v v22, (%3)\n\t"
+            ".insn r 0x57, 0x2, 0x51, x0, x22, x20\n\t"
+            "vle8.v v24, (%4)\n\t"
+            "vle8.v v26, (%5)\n\t"
+            ".insn r 0x57, 0x2, 0x51, x0, x26, x24\n\t"
+            "vle8.v v28, (%6)\n\t"
+            "vle8.v v30, (%7)\n\t"
+            ".insn r 0x57, 0x2, 0x51, x0, x30, x28\n\t"
+            :
+            : "r"(lhs_k), "r"(rhs_k),
+              "r"(lhs_k + M0), "r"(rhs_k + N0),
+              "r"(lhs_k + 2 * M0), "r"(rhs_k + 2 * N0),
+              "r"(lhs_k + 3 * M0), "r"(rhs_k + 3 * N0)
+            : "memory");
+        lhs_k += 4 * M0;
+        rhs_k += 4 * N0;
+      }
+      // Handle remaining 1-3 iterations
+      for (; k < (size_t)K; ++k) {
+        asm volatile(
+            "vle8.v v16, (%0)\n\t"
+            "vle8.v v18, (%1)\n\t"
+            ".insn r 0x57, 0x2, 0x51, x0, x18, x16\n\t"
+            :
+            : "r"(lhs_k), "r"(rhs_k)
+            : "memory");
+        lhs_k += M0;
+        rhs_k += N0;
+      }
+
+      asm volatile("vsetvli zero, %0, e32, m8, ta, ma" : : "r"(vl));
+      for (size_t r = 0; r < ml; r++) {
+        iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(r);
+        asm volatile("vse32.v v0, (%0)" : : "r"(&sub_out[r * N0]) : "memory");
+      }
+    }
+    // --- PATH B: Tail Case (M0 <= 8) ---
+    else {
+      asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl));
+      asm volatile("vmv.v.i v0, 0" : : : "memory");
+      iree_uk_riscv_64_xopu_opmvinbcast_m0_from_v0();
+
+      if (params->flags & IREE_UK_FLAG_MMT4D_ACCUMULATE) {
+        for (size_t row = 0; row < ml; ++row) {
+          asm volatile("vle32.v v0, (%0)" : : "r"(&sub_out[row * N0]) : "memory");
+          iree_uk_riscv_64_xopu_vmv_rv_m0_from_v0(row);
+        }
+      }
+
+      for (int k = 0; k < K; ++k) {
+        asm volatile("vsetvli zero, %0, e8, m1, ta, ma" : : "r"(ml));
+        asm volatile("vle8.v v4, (%0)" : : "r"(&lhs_ptr[k * M0]) : "memory");
+        asm volatile("vsetvli zero, %0, e8, m1, ta, ma" : : "r"(vl));
+        asm volatile("vle8.v v5, (%0)" : : "r"(&sub_rhs[k * N0]) : "memory");
+        asm volatile(".insn r 0x57, 0x2, 0x51, x0, x5, x4" : : : "memory");
+      }
+
+      asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl));
+      for (size_t r = 0; r < ml; r++) {
+        iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(r);
+        asm volatile("vse32.v v0, (%0)" : : "r"(&sub_out[r * N0]) : "memory");
+      }
+    }
+  }
+}
+
 IREE_UK_MMT4D_TILE_FUNC_IMPL_FOR_M0(
-    iree_uk_mmt4d_tile_s8s8s32_1xXXx16_to_16xXXx16_riscv_64_xopu,
-    iree_uk_mmt4d_tile_s8s8s32_1xXXx16_riscv_64_xopu, 1)
+    iree_uk_mmt4d_tile_s8s8s32_1xXXx1_to_16xXXx1_riscv_64_xopu,
+    iree_uk_mmt4d_tile_s8s8s32_1xXXx1_riscv_64_xopu, 1)
 IREE_UK_MMT4D_TILE_FUNC_IMPL_FOR_M0(
-    iree_uk_mmt4d_tile_s8s8s32_1xXXx16_to_16xXXx16_riscv_64_xopu,
-    iree_uk_mmt4d_tile_s8s8s32_2xXXx16_riscv_64_xopu, 2)
+    iree_uk_mmt4d_tile_s8s8s32_1xXXx1_to_16xXXx1_riscv_64_xopu,
+    iree_uk_mmt4d_tile_s8s8s32_2xXXx1_riscv_64_xopu, 2)
 IREE_UK_MMT4D_TILE_FUNC_IMPL_FOR_M0(
-    iree_uk_mmt4d_tile_s8s8s32_1xXXx16_to_16xXXx16_riscv_64_xopu,
-    iree_uk_mmt4d_tile_s8s8s32_4xXXx16_riscv_64_xopu, 4)
+    iree_uk_mmt4d_tile_s8s8s32_1xXXx1_to_16xXXx1_riscv_64_xopu,
+    iree_uk_mmt4d_tile_s8s8s32_4xXXx1_riscv_64_xopu, 4)
 IREE_UK_MMT4D_TILE_FUNC_IMPL_FOR_M0(
-    iree_uk_mmt4d_tile_s8s8s32_1xXXx16_to_16xXXx16_riscv_64_xopu,
-    iree_uk_mmt4d_tile_s8s8s32_8xXXx16_riscv_64_xopu, 8)
+    iree_uk_mmt4d_tile_s8s8s32_1xXXx1_to_16xXXx1_riscv_64_xopu,
+    iree_uk_mmt4d_tile_s8s8s32_8xXXx1_riscv_64_xopu, 8)
 IREE_UK_MMT4D_TILE_FUNC_IMPL_FOR_M0(
-    iree_uk_mmt4d_tile_s8s8s32_1xXXx16_to_16xXXx16_riscv_64_xopu,
-    iree_uk_mmt4d_tile_s8s8s32_16xXXx16_riscv_64_xopu, 16)
+    iree_uk_mmt4d_tile_s8s8s32_1xXXx1_to_16xXXx1_riscv_64_xopu,
+    iree_uk_mmt4d_tile_s8s8s32_16xXXx1_riscv_64_xopu, 16)
+
+// =============================================================================
+// Saturn OPU int8 K0=1, M0=32: 2x2 output tiling using all 4 matrix registers.
+//
+// Processes a 32x32 output tile as four 16x16 sub-tiles:
+//   m0: sub-tile (0,0)  m1: sub-tile (0,1)
+//   m2: sub-tile (1,0)  m3: sub-tile (1,1)
+//
+// Per K iteration: 2 A-loads + 2 B-loads → 4 VOPACCs (1.0 loads/VOPACC).
+// This is 2x better than the M0=16 path (2.0 loads/VOPACC).
+// =============================================================================
+
+void iree_uk_mmt4d_tile_s8s8s32_32xXXx1_riscv_64_xopu(
+    void* IREE_UK_RESTRICT out_tile, const void* IREE_UK_RESTRICT lhs_panel,
+    const void* IREE_UK_RESTRICT rhs_panel,
+    const iree_uk_mmt4d_params_t* params) {
+  const int M0 = 32;
+  iree_uk_int32_t* IREE_UK_RESTRICT out_ptr = out_tile;
+  const iree_uk_int8_t* IREE_UK_RESTRICT lhs_ptr = lhs_panel;
+  const iree_uk_int8_t* IREE_UK_RESTRICT rhs_ptr = rhs_panel;
+
+  const int N0 = params->N0;
+  const int K = params->K;
+  const int HW = 16;  // OPU hardware width
+
+  // Process N0 in chunks of 2*HW (32), each chunk uses m0+m1 (or m2+m3)
+  for (int n_start = 0; n_start < N0; n_start += 2 * HW) {
+    int n_chunk = (N0 - n_start < 2 * HW) ? (N0 - n_start) : (2 * HW);
+    int vl0 = (n_chunk < HW) ? n_chunk : HW;
+    int vl1 = (n_chunk > HW) ? (n_chunk - HW) : 0;
+
+    const iree_uk_int8_t* rhs0 = rhs_ptr + n_start;
+    const iree_uk_int8_t* rhs1 = rhs_ptr + n_start + HW;
+    iree_uk_int32_t* out0 = out_ptr + n_start;
+
+    // --- Init all 4 accumulators ---
+    // m0 = sub-tile(row0, col0), m1 = sub-tile(row0, col1)
+    // m2 = sub-tile(row1, col0), m3 = sub-tile(row1, col1)
+    asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl0));
+    asm volatile("vmv.v.i v0, 0" : : : "memory");
+    iree_uk_riscv_64_xopu_opmvinbcast_m0_from_v0();
+    // m1
+    asm volatile(".insn r 0x57, 0x6, 0x59, x1, x0, x0" : : : "memory");
+    // m2
+    asm volatile(".insn r 0x57, 0x6, 0x59, x2, x0, x0" : : : "memory");
+    // m3
+    asm volatile(".insn r 0x57, 0x6, 0x59, x3, x0, x0" : : : "memory");
+
+    if (params->flags & IREE_UK_FLAG_MMT4D_ACCUMULATE) {
+      // Load existing accumulators for all 4 sub-tiles
+      for (int r = 0; r < HW; ++r) {
+        // m0: rows 0..15, cols 0..15
+        asm volatile("vle32.v v0, (%0)" : : "r"(&out0[r * N0]) : "memory");
+        iree_uk_riscv_64_xopu_vmv_rv_m0_from_v0(r);
+        // m2: rows 16..31, cols 0..15
+        asm volatile("vle32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0]) : "memory");
+        asm volatile(".insn r 0x57, 0x6, 0x55, x2, %0, x0" : : "r"(r) : "memory");
+      }
+      if (vl1 > 0) {
+        asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl1));
+        for (int r = 0; r < HW; ++r) {
+          // m1: rows 0..15, cols 16..31
+          asm volatile("vle32.v v0, (%0)" : : "r"(&out0[r * N0 + HW]) : "memory");
+          asm volatile(".insn r 0x57, 0x6, 0x55, x1, %0, x0" : : "r"(r) : "memory");
+          // m3: rows 16..31, cols 16..31
+          asm volatile("vle32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0 + HW]) : "memory");
+          asm volatile(".insn r 0x57, 0x6, 0x55, x3, %0, x0" : : "r"(r) : "memory");
+        }
+      }
+    }
+
+    // --- K loop: 2x2 tiling, 4 VOPACCs per 4 loads ---
+    const iree_uk_int8_t* lhs_k = lhs_ptr;
+    const iree_uk_int8_t* rhs0_k = rhs0;
+    const iree_uk_int8_t* rhs1_k = rhs1;
+
+    asm volatile("vsetvli zero, %0, e8, m1, ta, ma" : : "r"(HW));
+
+    for (int k = 0; k < K; ++k) {
+      // Load A row 0 (M elements 0..15)
+      // Load B col 0
+      // VOPACC m0 (sub-tile 0,0)
+      // Load B col 1
+      // VOPACC m1 (sub-tile 0,1) — reuse A row 0
+      // Load A row 1 (M elements 16..31)
+      // VOPACC m2 (sub-tile 1,0) — reuse B col 0
+      // VOPACC m3 (sub-tile 1,1) — reuse B col 1
+      asm volatile(
+          "vle8.v v16, (%0)\n\t"   // A row 0
+          "vle8.v v17, (%1)\n\t"   // B col 0
+          ".insn r 0x57, 0x2, 0x51, x0, x17, x16\n\t"  // VOPACC m0
+          "vle8.v v18, (%2)\n\t"   // B col 1
+          ".insn r 0x57, 0x2, 0x51, x1, x18, x16\n\t"  // VOPACC m1
+          "vle8.v v19, (%3)\n\t"   // A row 1
+          ".insn r 0x57, 0x2, 0x51, x2, x17, x19\n\t"  // VOPACC m2 (reuse B col 0)
+          ".insn r 0x57, 0x2, 0x51, x3, x18, x19\n\t"  // VOPACC m3 (reuse B col 1)
+          :
+          : "r"(lhs_k), "r"(rhs0_k),
+            "r"(rhs1_k), "r"(lhs_k + HW)
+          : "memory");
+
+      lhs_k += M0;  // advance by 32 (full M0 stride)
+      rhs0_k += N0;
+      rhs1_k += N0;
+    }
+
+    // --- Store all 4 sub-tiles ---
+    asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl0));
+
+    // m0: rows 0..15, cols 0..vl0
+    for (int r = 0; r < HW; ++r) {
+      iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(r);
+      asm volatile("vse32.v v0, (%0)" : : "r"(&out0[r * N0]) : "memory");
+    }
+    // m2: rows 16..31, cols 0..vl0
+    for (int r = 0; r < HW; ++r) {
+      asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x2" : : "r"(r) : "memory");
+      asm volatile("vse32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0]) : "memory");
+    }
+
+    if (vl1 > 0) {
+      asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl1));
+      // m1: rows 0..15, cols HW..HW+vl1
+      for (int r = 0; r < HW; ++r) {
+        asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x1" : : "r"(r) : "memory");
+        asm volatile("vse32.v v0, (%0)" : : "r"(&out0[r * N0 + HW]) : "memory");
+      }
+      // m3: rows 16..31, cols HW..HW+vl1
+      for (int r = 0; r < HW; ++r) {
+        asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x3" : : "r"(r) : "memory");
+        asm volatile("vse32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0 + HW]) : "memory");
+      }
+    }
+  }
+}
+
+// M0=32 tile function is registered directly via tiles.inl.
+
+// =============================================================================
+// Saturn OPU int8 K0=1, M0=64: processes 64x64 output tiles in 4 passes
+// of 32x32 sub-blocks, each using the 2x2 tiling with m0-m3.
+// =============================================================================
+
+void iree_uk_mmt4d_tile_s8s8s32_64xXXx1_riscv_64_xopu(
+    void* IREE_UK_RESTRICT out_tile, const void* IREE_UK_RESTRICT lhs_panel,
+    const void* IREE_UK_RESTRICT rhs_panel,
+    const iree_uk_mmt4d_params_t* params) {
+  const int M0 = 64;
+  const int N0 = params->N0;
+  const int K = params->K;
+  const int HW = 16;
+  const int BLK = 2 * HW;  // 32: size of each 2x2 sub-block
+
+  iree_uk_int32_t* IREE_UK_RESTRICT out_ptr = out_tile;
+  const iree_uk_int8_t* IREE_UK_RESTRICT lhs_ptr = lhs_panel;
+  const iree_uk_int8_t* IREE_UK_RESTRICT rhs_ptr = rhs_panel;
+
+  // Process 64x64 in 4 passes of 32x32 sub-blocks
+  for (int m_blk = 0; m_blk < M0; m_blk += BLK) {
+    for (int n_blk = 0; n_blk < N0; n_blk += BLK) {
+      int n_chunk = (N0 - n_blk < BLK) ? (N0 - n_blk) : BLK;
+      int vl0 = (n_chunk < HW) ? n_chunk : HW;
+      int vl1 = (n_chunk > HW) ? (n_chunk - HW) : 0;
+
+      const iree_uk_int8_t* rhs0 = rhs_ptr + n_blk;
+      const iree_uk_int8_t* rhs1 = rhs_ptr + n_blk + HW;
+      iree_uk_int32_t* out0 = out_ptr + m_blk * N0 + n_blk;
+
+      // Init all 4 accumulators to zero
+      asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl0));
+      asm volatile("vmv.v.i v0, 0" : : : "memory");
+      // m0, m1, m2, m3
+      asm volatile(".insn r 0x57, 0x6, 0x59, x0, x0, x0" : : : "memory");
+      asm volatile(".insn r 0x57, 0x6, 0x59, x1, x0, x0" : : : "memory");
+      asm volatile(".insn r 0x57, 0x6, 0x59, x2, x0, x0" : : : "memory");
+      asm volatile(".insn r 0x57, 0x6, 0x59, x3, x0, x0" : : : "memory");
+
+      if (params->flags & IREE_UK_FLAG_MMT4D_ACCUMULATE) {
+        for (int r = 0; r < HW; ++r) {
+          asm volatile("vle32.v v0, (%0)" : : "r"(&out0[r * N0]) : "memory");
+          asm volatile(".insn r 0x57, 0x6, 0x55, x0, %0, x0" : : "r"(r) : "memory");
+          asm volatile("vle32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0]) : "memory");
+          asm volatile(".insn r 0x57, 0x6, 0x55, x2, %0, x0" : : "r"(r) : "memory");
+        }
+        if (vl1 > 0) {
+          asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl1));
+          for (int r = 0; r < HW; ++r) {
+            asm volatile("vle32.v v0, (%0)" : : "r"(&out0[r * N0 + HW]) : "memory");
+            asm volatile(".insn r 0x57, 0x6, 0x55, x1, %0, x0" : : "r"(r) : "memory");
+            asm volatile("vle32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0 + HW]) : "memory");
+            asm volatile(".insn r 0x57, 0x6, 0x55, x3, %0, x0" : : "r"(r) : "memory");
+          }
+        }
+      }
+
+      // K loop: 2x2 tiling with A-load reuse
+      const iree_uk_int8_t* lhs_k = lhs_ptr + m_blk;
+      const iree_uk_int8_t* rhs0_k = rhs0;
+      const iree_uk_int8_t* rhs1_k = rhs1;
+
+      asm volatile("vsetvli zero, %0, e8, m1, ta, ma" : : "r"(HW));
+
+      for (int k = 0; k < K; ++k) {
+        asm volatile(
+            "vle8.v v16, (%0)\n\t"   // A row 0 (m_blk..m_blk+15)
+            "vle8.v v17, (%1)\n\t"   // B col 0 (n_blk..n_blk+15)
+            ".insn r 0x57, 0x2, 0x51, x0, x17, x16\n\t"  // m0
+            "vle8.v v18, (%2)\n\t"   // B col 1 (n_blk+16..n_blk+31)
+            ".insn r 0x57, 0x2, 0x51, x1, x18, x16\n\t"  // m1
+            "vle8.v v19, (%3)\n\t"   // A row 1 (m_blk+16..m_blk+31)
+            ".insn r 0x57, 0x2, 0x51, x2, x17, x19\n\t"  // m2
+            ".insn r 0x57, 0x2, 0x51, x3, x18, x19\n\t"  // m3
+            :
+            : "r"(lhs_k), "r"(rhs0_k),
+              "r"(rhs1_k), "r"(lhs_k + HW)
+            : "memory");
+
+        lhs_k += M0;   // stride by full M0=64
+        rhs0_k += N0;
+        rhs1_k += N0;
+      }
+
+      // Store all 4 sub-tiles
+      asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl0));
+      for (int r = 0; r < HW; ++r) {
+        asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x0" : : "r"(r) : "memory");
+        asm volatile("vse32.v v0, (%0)" : : "r"(&out0[r * N0]) : "memory");
+      }
+      for (int r = 0; r < HW; ++r) {
+        asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x2" : : "r"(r) : "memory");
+        asm volatile("vse32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0]) : "memory");
+      }
+      if (vl1 > 0) {
+        asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl1));
+        for (int r = 0; r < HW; ++r) {
+          asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x1" : : "r"(r) : "memory");
+          asm volatile("vse32.v v0, (%0)" : : "r"(&out0[r * N0 + HW]) : "memory");
+        }
+        for (int r = 0; r < HW; ++r) {
+          asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x3" : : "r"(r) : "memory");
+          asm volatile("vse32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0 + HW]) : "memory");
+        }
+      }
+    }
+  }
+}
+
+// =============================================================================
+// Saturn OPU int8 K0=128 path with encoding swap.
+//
+// With the encoding swap, each K1 tile has layout [K0=128, M0=16] for LHS
+// and [K0=128, N0=16] for RHS. M0/N0 are innermost (contiguous), so
+// vle8.v loads 16 elements per K0 step — no strided loads needed.
+// The pack becomes a contiguous memcpy instead of strided gather.
+// =============================================================================
+
+IREE_UK_ATTRIBUTE_ALWAYS_INLINE static inline void
+iree_uk_mmt4d_tile_s8s8s32_1xXXx128_to_16xXXx128_riscv_64_xopu(
+    void* IREE_UK_RESTRICT out_tile, const void* IREE_UK_RESTRICT lhs_panel,
+    const void* IREE_UK_RESTRICT rhs_panel,
+    const iree_uk_mmt4d_params_t* params, int M0) {
+  IREE_UK_ASSERT(M0 >= 1 && M0 <= 16);
+  IREE_UK_ASSERT(params->K0 == 128);
+  iree_uk_int32_t* IREE_UK_RESTRICT out_ptr = out_tile;
+  const iree_uk_int8_t* IREE_UK_RESTRICT lhs_ptr = lhs_panel;
+  const iree_uk_int8_t* IREE_UK_RESTRICT rhs_ptr = rhs_panel;
+
+  const int N0 = params->N0;
+  const int K0 = 128;
+  const int HW_WIDTH = 16;
+
+  for (int n_start = 0; n_start < N0; n_start += HW_WIDTH) {
+    int n_rem = N0 - n_start;
+    size_t vl = (n_rem < HW_WIDTH) ? n_rem : HW_WIDTH;
+    size_t ml = M0;
+
+    const iree_uk_int8_t* sub_rhs = rhs_ptr + n_start * K0;
+    iree_uk_int32_t* sub_out = out_ptr + n_start;
+
+    if (M0 == 16) {
+      // Init accumulator
+      asm volatile("vsetvli zero, %0, e32, m8, ta, ma" : : "r"(vl));
+      asm volatile("vmv.v.i v0, 0" : : : "memory");
+      iree_uk_riscv_64_xopu_opmvinbcast_m0_from_v0();
+
+      if (params->flags & IREE_UK_FLAG_MMT4D_ACCUMULATE) {
+        for (int row = 0; row < 16; ++row) {
+          asm volatile("vle32.v v0, (%0)" : : "r"(&sub_out[row * N0]) : "memory");
+          iree_uk_riscv_64_xopu_vmv_rv_m0_from_v0(row);
+        }
+      }
+
+      // K loop: iterate over K1 tiles, each with K0=128 inner steps.
+      // With encoding swap: LHS layout is [K0, M0] = M0 contiguous per K0 step.
+      asm volatile("vsetvli zero, %0, e8, m2, ta, ma" : : "r"(ml));
+      for (int k1 = 0; k1 < params->K; ++k1) {
+        const iree_uk_int8_t* lhs_k = lhs_ptr + k1 * M0 * K0;
+        const iree_uk_int8_t* rhs_k = sub_rhs + k1 * N0 * K0;
+
+        // Inner K0=128 loop, 4x unrolled
+        int k0 = 0;
+        for (; k0 + 4 <= K0; k0 += 4) {
+          asm volatile(
+              "vle8.v v16, (%0)\n\t"
+              "vle8.v v18, (%1)\n\t"
+              ".insn r 0x57, 0x2, 0x51, x0, x18, x16\n\t"
+              "vle8.v v20, (%2)\n\t"
+              "vle8.v v22, (%3)\n\t"
+              ".insn r 0x57, 0x2, 0x51, x0, x22, x20\n\t"
+              "vle8.v v24, (%4)\n\t"
+              "vle8.v v26, (%5)\n\t"
+              ".insn r 0x57, 0x2, 0x51, x0, x26, x24\n\t"
+              "vle8.v v28, (%6)\n\t"
+              "vle8.v v30, (%7)\n\t"
+              ".insn r 0x57, 0x2, 0x51, x0, x30, x28\n\t"
+              :
+              : "r"(lhs_k + k0 * M0), "r"(rhs_k + k0 * N0),
+                "r"(lhs_k + (k0 + 1) * M0), "r"(rhs_k + (k0 + 1) * N0),
+                "r"(lhs_k + (k0 + 2) * M0), "r"(rhs_k + (k0 + 2) * N0),
+                "r"(lhs_k + (k0 + 3) * M0), "r"(rhs_k + (k0 + 3) * N0)
+              : "memory");
+        }
+        for (; k0 < K0; ++k0) {
+          asm volatile(
+              "vle8.v v16, (%0)\n\t"
+              "vle8.v v18, (%1)\n\t"
+              ".insn r 0x57, 0x2, 0x51, x0, x18, x16\n\t"
+              :
+              : "r"(lhs_k + k0 * M0), "r"(rhs_k + k0 * N0)
+              : "memory");
+        }
+      }
+
+      // Store results
+      asm volatile("vsetvli zero, %0, e32, m8, ta, ma" : : "r"(vl));
+      for (size_t r = 0; r < ml; r++) {
+        iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(r);
+        asm volatile("vse32.v v0, (%0)" : : "r"(&sub_out[r * N0]) : "memory");
+      }
+    } else {
+      // Tail case (M0 <= 8): use smaller LMUL
+      asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl));
+      asm volatile("vmv.v.i v0, 0" : : : "memory");
+      iree_uk_riscv_64_xopu_opmvinbcast_m0_from_v0();
+
+      if (params->flags & IREE_UK_FLAG_MMT4D_ACCUMULATE) {
+        for (size_t row = 0; row < ml; ++row) {
+          asm volatile("vle32.v v0, (%0)" : : "r"(&sub_out[row * N0]) : "memory");
+          iree_uk_riscv_64_xopu_vmv_rv_m0_from_v0(row);
+        }
+      }
+
+      asm volatile("vsetvli zero, %0, e8, m1, ta, ma" : : "r"(ml));
+      for (int k1 = 0; k1 < params->K; ++k1) {
+        const iree_uk_int8_t* lhs_k = lhs_ptr + k1 * M0 * K0;
+        const iree_uk_int8_t* rhs_k = sub_rhs + k1 * N0 * K0;
+        for (int k0 = 0; k0 < K0; ++k0) {
+          asm volatile(
+              "vle8.v v4, (%0)\n\t"
+              "vle8.v v5, (%1)\n\t"
+              ".insn r 0x57, 0x2, 0x51, x0, x5, x4\n\t"
+              :
+              : "r"(lhs_k + k0 * M0), "r"(rhs_k + k0 * N0)
+              : "memory");
+        }
+      }
+
+      asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl));
+      for (size_t r = 0; r < ml; r++) {
+        iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(r);
+        asm volatile("vse32.v v0, (%0)" : : "r"(&sub_out[r * N0]) : "memory");
+      }
+    }
+  }
+}
+
+IREE_UK_MMT4D_TILE_FUNC_IMPL_FOR_M0(
+    iree_uk_mmt4d_tile_s8s8s32_1xXXx128_to_16xXXx128_riscv_64_xopu,
+    iree_uk_mmt4d_tile_s8s8s32_1xXXx128_riscv_64_xopu, 1)
+IREE_UK_MMT4D_TILE_FUNC_IMPL_FOR_M0(
+    iree_uk_mmt4d_tile_s8s8s32_1xXXx128_to_16xXXx128_riscv_64_xopu,
+    iree_uk_mmt4d_tile_s8s8s32_2xXXx128_riscv_64_xopu, 2)
+IREE_UK_MMT4D_TILE_FUNC_IMPL_FOR_M0(
+    iree_uk_mmt4d_tile_s8s8s32_1xXXx128_to_16xXXx128_riscv_64_xopu,
+    iree_uk_mmt4d_tile_s8s8s32_4xXXx128_riscv_64_xopu, 4)
+IREE_UK_MMT4D_TILE_FUNC_IMPL_FOR_M0(
+    iree_uk_mmt4d_tile_s8s8s32_1xXXx128_to_16xXXx128_riscv_64_xopu,
+    iree_uk_mmt4d_tile_s8s8s32_8xXXx128_riscv_64_xopu, 8)
+IREE_UK_MMT4D_TILE_FUNC_IMPL_FOR_M0(
+    iree_uk_mmt4d_tile_s8s8s32_1xXXx128_to_16xXXx128_riscv_64_xopu,
+    iree_uk_mmt4d_tile_s8s8s32_16xXXx128_riscv_64_xopu, 16)
 
 // =============================================================================
 // Saturn OPU FP8: OPFMACC (f8E4M3FN x f8E4M3FN -> f32 accumulation)
