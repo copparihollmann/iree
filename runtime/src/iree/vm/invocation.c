@@ -537,7 +537,11 @@ IREE_API_EXPORT iree_status_t iree_vm_begin_invoke(
   // Marshal the input arguments into the VM ABI and preallocate the result
   // buffer. If marshaling fails we need to cleanup the arguments.
   // NOTE: today we don't support variadic arguments through this interface.
+#ifdef IREE_PLATFORM_GENERIC
+  status =
+#else
   iree_status_t status =
+#endif
       iree_vm_invoke_marshal_inputs(cconv_arguments, inputs, arguments);
   if (!iree_status_is_ok(status)) {
     iree_vm_invoke_release_argument_storage(cconv_arguments, arguments,
