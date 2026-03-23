@@ -28,7 +28,7 @@ iree_uk_query_matmul_tile_sizes_riscv_64_i8i8i32(
     return (iree_uk_matmul_tile_sizes_t){.M = 4, .K = 8, .N = 4};
   }
   if (iree_uk_cpu_riscv_64_xopu(params->cpu_data)) {
-    return (iree_uk_matmul_tile_sizes_t){.M = 16, .K = 16, .N = 16};
+    return (iree_uk_matmul_tile_sizes_t){.M = 64, .K = 1, .N = 64};
   }
   if (iree_uk_cpu_riscv_64_v(params->cpu_data)) {
     return (iree_uk_matmul_tile_sizes_t){.M = 8, .K = 1, .N = 16};
