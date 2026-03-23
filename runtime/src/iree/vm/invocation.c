@@ -493,10 +493,7 @@ IREE_API_EXPORT iree_status_t iree_vm_begin_invoke(
   // storage. This reduces the overall available stack space but not by much,
   // and if the stack needs to dynamically grow the inlined storage will still
   // be available.
-<<<<<<< HEAD
   iree_byte_span_t results = iree_byte_span_empty();
-=======
-  iree_byte_span_t results = iree_make_byte_span(NULL, 0);
 #ifdef IREE_PLATFORM_GENERIC
   status = iree_vm_function_call_compute_cconv_fragment_size(
       cconv_results, /*segment_size_list=*/NULL, &results.data_length);
@@ -507,7 +504,6 @@ IREE_API_EXPORT iree_status_t iree_vm_begin_invoke(
     return status;
   }
 #else
->>>>>>> 2b7dd40a5a ([Bare-metal] [Runtime] Conditional build for bare-metal implementation in the runtime)
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_vm_function_call_compute_cconv_fragment_size(
               cconv_results, /*segment_size_list=*/NULL, &results.data_length));
