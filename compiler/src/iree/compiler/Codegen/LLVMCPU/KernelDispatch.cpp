@@ -1751,12 +1751,9 @@ getMatmulRISCVVectorSizes(mlir::FunctionOpInterface entryPointFn,
   if (failed(elementType)) {
     return;
   }
-<<<<<<< HEAD
 
   // nativeVectorSize is calculated with VLEN and LMUL=2.
   int64_t nativeVectorSize = getNativeVectorSizeInBytes(entryPointFn);
-=======
->>>>>>> 78124337df ([modify] Kernel Dispatch logic for int8 RVV and `+xsmtvdot` with correct lowering strategy)
   int64_t elementSize;
   if (elementType->isF16()) {
     elementSize = 16;
