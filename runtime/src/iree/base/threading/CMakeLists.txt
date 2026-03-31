@@ -50,7 +50,7 @@ iree_cc_library(
     "thread_pthreads.c"
     "thread_win32.c"
   DEPS
-    ${CMAKE_DL_LIBS}
+    $<$<BOOL:${IREE_ENABLE_THREADING}>:${CMAKE_DL_LIBS}>
     ::threading
     iree::base
     iree::base::core_headers

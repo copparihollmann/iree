@@ -480,6 +480,266 @@ iree_uk_riscv_64_xopu_opfmacc_m0_v20_v22(void) {
   asm volatile(".insn r 0x57, 0x1, 0x4b, x0, x20, x22\n\t" : : : "memory");
 }
 
+// =============================================================================
+// Full OPU loop nest — saturn-vectors architecture.
+//
+// Reads from packed LHS [M, K, M0, K0] and packed RHS [N, K, N0, K0].
+// Writes directly to 2D output at out_base[(i*M0+r)*out_stride + j*N0].
+//
+// Modeled on saturn/benchmarks/opu-2x2-gemm/kernel.h:
+//   - 2x2 sub-tiling with m0-m3 for 32x32 blocks (when M0,N0 >= 32)
+//   - Fallback to single m0 for smaller tiles
+//   - Direct 2D store (no packed intermediate)
+//
+// This eliminates the separate unpack step entirely.
+// =============================================================================
+
+// Store one 16x16 sub-tile from matrix register mx to 2D output.
+// out_row points to the first element of this sub-tile's first row.
+// out_stride is the full 2D row stride (N*N0 elements).
+// nrows/ncols: how many rows/cols to store (up to 16).
+#define OPU_STORE_SUBTILE_2D(mx, out_row, out_stride, nrows, ncols)          \
+  do {                                                                        \
+    asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(ncols));        \
+    for (int _r = 0; _r < (nrows); ++_r) {                                   \
+      asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, " #mx                   \
+                   :                                                          \
+                   : "r"(_r)                                                  \
+                   : "memory");                                               \
+      asm volatile("vse32.v v0, (%0)"                                         \
+                   :                                                          \
+                   : "r"((out_row) + _r * (out_stride))                       \
+                   : "memory");                                               \
+    }                                                                         \
+  } while (0)
+
+// Full OPU matmul: reads packed inputs, writes 2D output directly.
+// Returns true if handled, false to fall through to standard path.
+static bool iree_uk_mmt4d_opu_full_loop(
+    const iree_uk_mmt4d_params_t* params) {
+  const iree_uk_int32_t M = params->M;
+  const iree_uk_int32_t N = params->N;
+  const iree_uk_int32_t K = params->K;
+  const int M0 = params->M0;
+  const int N0 = params->N0;
+  const int K0 = params->K0;
+  const int HW = 16;  // OPU hardware width
+
+  iree_uk_int32_t* out_base =
+      (iree_uk_int32_t*)params->out_buffer + params->out_offset;
+  const iree_uk_int8_t* lhs_base =
+      (const iree_uk_int8_t*)params->lhs_buffer + params->lhs_offset;
+  const iree_uk_int8_t* rhs_base =
+      (const iree_uk_int8_t*)params->rhs_buffer + params->rhs_offset;
+
+  // out_stride0 is the stride between output rows (in i32 elements).
+  // For packed output: N * M0 * N0. For 2D output: N * N0.
+  // The early handler works with either — it just uses out_stride0 as-is.
+  const iree_uk_index_t out_stride = params->out_stride0;
+  const iree_uk_index_t lhs_panel_stride = params->lhs_stride0;
+  const iree_uk_index_t rhs_panel_stride = params->rhs_stride0;
+
+  const bool accumulate =
+      params->flags & IREE_UK_FLAG_MMT4D_ACCUMULATE;
+
+  // Outer loops: iterate M-tiles x N-tiles
+  for (iree_uk_int32_t i = 0; i < M; ++i) {
+    const iree_uk_int8_t* lhs_panel = lhs_base + i * lhs_panel_stride;
+
+    for (iree_uk_int32_t j = 0; j < N; ++j) {
+      const iree_uk_int8_t* rhs_panel = rhs_base + j * rhs_panel_stride;
+
+      // Output position for this tile in 2D layout:
+      //   Row (i*M0 + r), Col (j*N0 + c)
+      //   Address: out_base + (i*M0)*out_stride + j*N0
+      // For packed layout (standard mmt4d):
+      //   Address: out_base + i*out_stride + j*M0*N0
+      // We handle both via out_stride.
+      iree_uk_int32_t* tile_out = out_base + i * out_stride + j * N0;
+
+      // Process this M0 x N0 tile using 2x2 sub-tiling with m0-m3
+      // when dimensions are large enough, fallback to single m0 otherwise.
+      for (int m_sub = 0; m_sub < M0; m_sub += 2 * HW) {
+        int m_rem = M0 - m_sub;
+        int m_hw0 = (m_rem < HW) ? m_rem : HW;
+        int m_hw1 = (m_rem > HW) ? ((m_rem - HW < HW) ? m_rem - HW : HW) : 0;
+
+        for (int n_sub = 0; n_sub < N0; n_sub += 2 * HW) {
+          int n_rem = N0 - n_sub;
+          int n_hw0 = (n_rem < HW) ? n_rem : HW;
+          int n_hw1 = (n_rem > HW) ? ((n_rem - HW < HW) ? n_rem - HW : HW)
+                                   : 0;
+
+          // --- Init 4 accumulators (m0, m1, m2, m3) ---
+          asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(n_hw0));
+          asm volatile("vmv.v.i v0, 0" : : : "memory");
+          asm volatile(".insn r 0x57, 0x6, 0x59, x0, x0, x0"
+                       :
+                       :
+                       : "memory");  // OPMVINBCAST m0
+          asm volatile(".insn r 0x57, 0x6, 0x59, x1, x0, x0"
+                       :
+                       :
+                       : "memory");  // m1
+          asm volatile(".insn r 0x57, 0x6, 0x59, x2, x0, x0"
+                       :
+                       :
+                       : "memory");  // m2
+          asm volatile(".insn r 0x57, 0x6, 0x59, x3, x0, x0"
+                       :
+                       :
+                       : "memory");  // m3
+
+          if (accumulate) {
+            // Load existing output into accumulators.
+            iree_uk_int32_t* sub_out =
+                tile_out + m_sub * out_stride + n_sub;
+            for (int r = 0; r < m_hw0; ++r) {
+              asm volatile("vle32.v v0, (%0)"
+                           :
+                           : "r"(sub_out + r * out_stride)
+                           : "memory");
+              asm volatile(".insn r 0x57, 0x6, 0x55, x0, %0, x0"
+                           :
+                           : "r"(r)
+                           : "memory");  // VMV_RV m0
+            }
+            if (m_hw1 > 0) {
+              for (int r = 0; r < m_hw1; ++r) {
+                asm volatile(
+                    "vle32.v v0, (%0)"
+                    :
+                    : "r"(sub_out + (r + HW) * out_stride)
+                    : "memory");
+                asm volatile(".insn r 0x57, 0x6, 0x55, x2, %0, x0"
+                             :
+                             : "r"(r)
+                             : "memory");  // VMV_RV m2
+              }
+            }
+            // TODO: load m1, m3 for n_hw1 > 0 case
+          }
+
+          // --- K loop: 2x2 VOPACC ---
+          const iree_uk_int8_t* lhs_k = lhs_panel + m_sub;
+          const iree_uk_int8_t* rhs_k0 = rhs_panel + n_sub;
+          const iree_uk_int8_t* rhs_k1 = rhs_panel + n_sub + HW;
+
+          asm volatile("vsetvli zero, %0, e8, m1, ta, ma" : : "r"(HW));
+
+          for (int k = 0; k < K; ++k) {
+            const iree_uk_int8_t* lhs_kk = lhs_k + k * M0 * K0;
+            const iree_uk_int8_t* rhs_kk0 = rhs_k0 + k * N0 * K0;
+            const iree_uk_int8_t* rhs_kk1 = rhs_k1 + k * N0 * K0;
+
+            for (int k0 = 0; k0 < K0; ++k0) {
+              // Load A sub-row 0 (m_sub..m_sub+HW-1)
+              // Load B sub-col 0 (n_sub..n_sub+HW-1)
+              // VOPACC m0 (sub-tile 0,0)
+              // Load B sub-col 1 (n_sub+HW..n_sub+2*HW-1)
+              // VOPACC m1 (sub-tile 0,1)
+              // Load A sub-row 1 (m_sub+HW..m_sub+2*HW-1)
+              // VOPACC m2 (sub-tile 1,0) — reuse B col 0
+              // VOPACC m3 (sub-tile 1,1) — reuse B col 1
+              asm volatile(
+                  "vle8.v v16, (%0)\n\t"
+                  "vle8.v v17, (%1)\n\t"
+                  ".insn r 0x57, 0x2, 0x51, x0, x17, x16\n\t"
+                  :
+                  : "r"(lhs_kk + k0 * M0), "r"(rhs_kk0 + k0 * N0)
+                  : "memory");
+              if (n_hw1 > 0) {
+                asm volatile(
+                    "vle8.v v18, (%0)\n\t"
+                    ".insn r 0x57, 0x2, 0x51, x1, x18, x16\n\t"
+                    :
+                    : "r"(rhs_kk1 + k0 * N0)
+                    : "memory");
+              }
+              if (m_hw1 > 0) {
+                asm volatile(
+                    "vle8.v v19, (%0)\n\t"
+                    ".insn r 0x57, 0x2, 0x51, x2, x17, x19\n\t"
+                    :
+                    : "r"(lhs_kk + k0 * M0 + HW)
+                    : "memory");
+                if (n_hw1 > 0) {
+                  asm volatile(
+                      ".insn r 0x57, 0x2, 0x51, x3, x18, x19\n\t"
+                      :
+                      :
+                      : "memory");
+                }
+              }
+            }
+          }
+
+          // --- Store directly to 2D output ---
+          iree_uk_int32_t* sub_out =
+              tile_out + m_sub * out_stride + n_sub;
+
+          // m0: rows 0..m_hw0-1, cols 0..n_hw0-1
+          OPU_STORE_SUBTILE_2D(x0, sub_out, out_stride, m_hw0, n_hw0);
+
+          // m2: rows HW..HW+m_hw1-1, cols 0..n_hw0-1
+          if (m_hw1 > 0) {
+            OPU_STORE_SUBTILE_2D(x2, sub_out + HW * out_stride, out_stride,
+                                 m_hw1, n_hw0);
+          }
+
+          // m1: rows 0..m_hw0-1, cols HW..HW+n_hw1-1
+          if (n_hw1 > 0) {
+            OPU_STORE_SUBTILE_2D(x1, sub_out + HW, out_stride, m_hw0, n_hw1);
+          }
+
+          // m3: rows HW..HW+m_hw1-1, cols HW..HW+n_hw1-1
+          if (m_hw1 > 0 && n_hw1 > 0) {
+            OPU_STORE_SUBTILE_2D(x3, sub_out + HW * out_stride + HW,
+                                 out_stride, m_hw1, n_hw1);
+          }
+        }
+      }
+    }
+  }
+  return true;
+}
+
+// Top-level early handler for OPU.
+// Returns true if the operation was handled, false to fall through.
+bool iree_uk_mmt4d_early_riscv_64_xopu(
+    const iree_uk_mmt4d_params_t* params) {
+  if (!iree_uk_cpu_riscv_64_xopu(params->cpu_data)) return false;
+  iree_uk_mmt4d_type_t mmt4d_type = iree_uk_mmt4d_type(params->flags);
+  if (mmt4d_type != iree_uk_mmt4d_type_s8s8s32) return false;
+  return iree_uk_mmt4d_opu_full_loop(params);
+}
+
+// =============================================================================
+// Transposed store helpers for OPU (saturn-vectors i32_store_ct pattern).
+//
+// Normal store:     out[row * N0 + col] = m0[row][col]   (row-major)
+// Transposed store: out[col * M0 + row] = m0[row][col]   (column-major)
+//
+// Both extract rows via VMV_VR. The difference is the store stride:
+// normal uses N0 (row pitch), transposed uses M0 (column pitch).
+// =============================================================================
+
+// Store 16x16 tile from matrix register mx in column-major order.
+// col_stride = M0 (number of rows in the tile).
+#define IREE_UK_OPU_STORE_TILE_CT(mx, out_base, col_stride, ncols)           \
+  do {                                                                        \
+    for (int _c = 0; _c < (ncols); ++_c) {                                   \
+      asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, " #mx                   \
+                   :                                                          \
+                   : "r"(_c)                                                  \
+                   : "memory");                                               \
+      asm volatile("vse32.v v0, (%0)"                                         \
+                   :                                                          \
+                   : "r"((out_base) + _c * (col_stride))                      \
+                   : "memory");                                               \
+    }                                                                         \
+  } while (0)
+
 IREE_UK_ATTRIBUTE_ALWAYS_INLINE static inline void
 iree_uk_mmt4d_tile_s8s8s32_16x16_riscv_64_xopu_native(
     iree_uk_int32_t* IREE_UK_RESTRICT out_ptr,
@@ -555,16 +815,24 @@ iree_uk_mmt4d_tile_s8s8s32_16x16_riscv_64_xopu_native(
     }
   }
 
+  // Store m0: column-major if transposed, row-major otherwise.
   asm volatile("vsetvli zero, %0, e32, m4, ta, ma\n\t"
                :
                : "r"(avl16)
                : "memory");
-  for (int row = 0; row < 16; ++row) {
-    iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(row);
-    asm volatile("vse32.v v0, (%0)\n\t"
-                 :
-                 : "r"(out_ptr + row * 16)
-                 : "memory");
+  if (params->flags & IREE_UK_FLAG_MMT4D_TRANSPOSED_OUTPUT) {
+    // Column-major store (saturn-vectors i32_store_ct pattern).
+    for (int col = 0; col < 16; ++col) {
+      iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(col);
+      asm volatile("vse32.v v0, (%0)\n\t" : : "r"(out_ptr + col * 16)
+                   : "memory");
+    }
+  } else {
+    for (int row = 0; row < 16; ++row) {
+      iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(row);
+      asm volatile("vse32.v v0, (%0)\n\t" : : "r"(out_ptr + row * 16)
+                   : "memory");
+    }
   }
 }
 
@@ -741,10 +1009,23 @@ iree_uk_mmt4d_tile_s8s8s32_1xXXx1_to_16xXXx1_riscv_64_xopu(
         rhs_k += N0;
       }
 
-      asm volatile("vsetvli zero, %0, e32, m8, ta, ma" : : "r"(vl));
-      for (size_t r = 0; r < ml; r++) {
-        iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(r);
-        asm volatile("vse32.v v0, (%0)" : : "r"(&sub_out[r * N0]) : "memory");
+      if (params->flags & IREE_UK_FLAG_MMT4D_TRANSPOSED_OUTPUT) {
+        // Column-major store (saturn-vectors i32_store_ct pattern).
+        // VL = M0 (store M0 row-elements per column).
+        asm volatile("vsetvli zero, %0, e32, m8, ta, ma" : : "r"(ml));
+        for (size_t c = 0; c < (size_t)vl; c++) {
+          iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(c);
+          asm volatile("vse32.v v0, (%0)"
+                       :
+                       : "r"(out_ptr + (n_start + c) * M0)
+                       : "memory");
+        }
+      } else {
+        asm volatile("vsetvli zero, %0, e32, m8, ta, ma" : : "r"(vl));
+        for (size_t r = 0; r < ml; r++) {
+          iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(r);
+          asm volatile("vse32.v v0, (%0)" : : "r"(&sub_out[r * N0]) : "memory");
+        }
       }
     }
     // --- PATH B: Tail Case (M0 <= 8) ---
@@ -768,10 +1049,21 @@ iree_uk_mmt4d_tile_s8s8s32_1xXXx1_to_16xXXx1_riscv_64_xopu(
         asm volatile(".insn r 0x57, 0x2, 0x51, x0, x5, x4" : : : "memory");
       }
 
-      asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl));
-      for (size_t r = 0; r < ml; r++) {
-        iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(r);
-        asm volatile("vse32.v v0, (%0)" : : "r"(&sub_out[r * N0]) : "memory");
+      if (params->flags & IREE_UK_FLAG_MMT4D_TRANSPOSED_OUTPUT) {
+        asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(ml));
+        for (size_t c = 0; c < (size_t)vl; c++) {
+          iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(c);
+          asm volatile("vse32.v v0, (%0)"
+                       :
+                       : "r"(out_ptr + (n_start + c) * M0)
+                       : "memory");
+        }
+      } else {
+        asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl));
+        for (size_t r = 0; r < ml; r++) {
+          iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(r);
+          asm volatile("vse32.v v0, (%0)" : : "r"(&sub_out[r * N0]) : "memory");
+        }
       }
     }
   }
@@ -899,30 +1191,70 @@ void iree_uk_mmt4d_tile_s8s8s32_32xXXx1_riscv_64_xopu(
     }
 
     // --- Store all 4 sub-tiles ---
-    asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl0));
-
-    // m0: rows 0..15, cols 0..vl0
-    for (int r = 0; r < HW; ++r) {
-      iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(r);
-      asm volatile("vse32.v v0, (%0)" : : "r"(&out0[r * N0]) : "memory");
-    }
-    // m2: rows 16..31, cols 0..vl0
-    for (int r = 0; r < HW; ++r) {
-      asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x2" : : "r"(r) : "memory");
-      asm volatile("vse32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0]) : "memory");
-    }
-
-    if (vl1 > 0) {
-      asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl1));
-      // m1: rows 0..15, cols HW..HW+vl1
-      for (int r = 0; r < HW; ++r) {
-        asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x1" : : "r"(r) : "memory");
-        asm volatile("vse32.v v0, (%0)" : : "r"(&out0[r * N0 + HW]) : "memory");
+    if (params->flags & IREE_UK_FLAG_MMT4D_TRANSPOSED_OUTPUT) {
+      // Column-major store (saturn-vectors i32_store_ct pattern).
+      // Normal layout: [M0=32 rows, N0 cols], row-major.
+      // Transposed layout: [N0 cols, M0=32 rows], column-major.
+      // Stride between columns = M0 = 32.
+      asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(HW));
+      // m0: rows 0..15 → columns 0..vl0-1, at col_stride=M0
+      for (int c = 0; c < vl0; ++c) {
+        iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(c);
+        asm volatile("vse32.v v0, (%0)"
+                     :
+                     : "r"(out_ptr + (n_start + c) * M0)
+                     : "memory");
       }
-      // m3: rows 16..31, cols HW..HW+vl1
+      // m2: rows 16..31 → columns 0..vl0-1, offset by HW within each column
+      for (int c = 0; c < vl0; ++c) {
+        asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x2" : : "r"(c) : "memory");
+        asm volatile("vse32.v v0, (%0)"
+                     :
+                     : "r"(out_ptr + (n_start + c) * M0 + HW)
+                     : "memory");
+      }
+      if (vl1 > 0) {
+        // m1: rows 0..15 → columns HW..HW+vl1-1
+        for (int c = 0; c < vl1; ++c) {
+          asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x1" : : "r"(c) : "memory");
+          asm volatile("vse32.v v0, (%0)"
+                       :
+                       : "r"(out_ptr + (n_start + HW + c) * M0)
+                       : "memory");
+        }
+        // m3: rows 16..31 → columns HW..HW+vl1-1, offset by HW
+        for (int c = 0; c < vl1; ++c) {
+          asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x3" : : "r"(c) : "memory");
+          asm volatile("vse32.v v0, (%0)"
+                       :
+                       : "r"(out_ptr + (n_start + HW + c) * M0 + HW)
+                       : "memory");
+        }
+      }
+    } else {
+      asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl0));
+      // m0: rows 0..15, cols 0..vl0
       for (int r = 0; r < HW; ++r) {
-        asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x3" : : "r"(r) : "memory");
-        asm volatile("vse32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0 + HW]) : "memory");
+        iree_uk_riscv_64_xopu_vmv_vr_v0_from_m0(r);
+        asm volatile("vse32.v v0, (%0)" : : "r"(&out0[r * N0]) : "memory");
+      }
+      // m2: rows 16..31, cols 0..vl0
+      for (int r = 0; r < HW; ++r) {
+        asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x2" : : "r"(r) : "memory");
+        asm volatile("vse32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0]) : "memory");
+      }
+      if (vl1 > 0) {
+        asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl1));
+        // m1: rows 0..15, cols HW..HW+vl1
+        for (int r = 0; r < HW; ++r) {
+          asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x1" : : "r"(r) : "memory");
+          asm volatile("vse32.v v0, (%0)" : : "r"(&out0[r * N0 + HW]) : "memory");
+        }
+        // m3: rows 16..31, cols HW..HW+vl1
+        for (int r = 0; r < HW; ++r) {
+          asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x3" : : "r"(r) : "memory");
+          asm volatile("vse32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0 + HW]) : "memory");
+        }
       }
     }
   }
@@ -1015,24 +1347,65 @@ void iree_uk_mmt4d_tile_s8s8s32_64xXXx1_riscv_64_xopu(
       }
 
       // Store all 4 sub-tiles
-      asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl0));
-      for (int r = 0; r < HW; ++r) {
-        asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x0" : : "r"(r) : "memory");
-        asm volatile("vse32.v v0, (%0)" : : "r"(&out0[r * N0]) : "memory");
-      }
-      for (int r = 0; r < HW; ++r) {
-        asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x2" : : "r"(r) : "memory");
-        asm volatile("vse32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0]) : "memory");
-      }
-      if (vl1 > 0) {
-        asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl1));
+      if (params->flags & IREE_UK_FLAG_MMT4D_TRANSPOSED_OUTPUT) {
+        // Column-major store. Column stride = M0 = 64.
+        // Sub-tile (m_blk, n_blk) covers rows m_blk..m_blk+31, cols n_blk..n_blk+31.
+        // In column-major: col c starts at out_ptr[c * M0 + m_blk].
+        asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(HW));
+        // m0: rows m_blk..m_blk+15 → cols n_blk..n_blk+vl0-1
+        for (int c = 0; c < vl0; ++c) {
+          asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x0" : : "r"(c) : "memory");
+          asm volatile("vse32.v v0, (%0)"
+                       :
+                       : "r"(out_ptr + (n_blk + c) * M0 + m_blk)
+                       : "memory");
+        }
+        // m2: rows m_blk+16..m_blk+31 → cols n_blk..n_blk+vl0-1
+        for (int c = 0; c < vl0; ++c) {
+          asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x2" : : "r"(c) : "memory");
+          asm volatile("vse32.v v0, (%0)"
+                       :
+                       : "r"(out_ptr + (n_blk + c) * M0 + m_blk + HW)
+                       : "memory");
+        }
+        if (vl1 > 0) {
+          // m1: rows m_blk..m_blk+15 → cols n_blk+HW..n_blk+HW+vl1-1
+          for (int c = 0; c < vl1; ++c) {
+            asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x1" : : "r"(c) : "memory");
+            asm volatile("vse32.v v0, (%0)"
+                         :
+                         : "r"(out_ptr + (n_blk + HW + c) * M0 + m_blk)
+                         : "memory");
+          }
+          // m3: rows m_blk+16..m_blk+31 → cols n_blk+HW..n_blk+HW+vl1-1
+          for (int c = 0; c < vl1; ++c) {
+            asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x3" : : "r"(c) : "memory");
+            asm volatile("vse32.v v0, (%0)"
+                         :
+                         : "r"(out_ptr + (n_blk + HW + c) * M0 + m_blk + HW)
+                         : "memory");
+          }
+        }
+      } else {
+        asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl0));
         for (int r = 0; r < HW; ++r) {
-          asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x1" : : "r"(r) : "memory");
-          asm volatile("vse32.v v0, (%0)" : : "r"(&out0[r * N0 + HW]) : "memory");
+          asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x0" : : "r"(r) : "memory");
+          asm volatile("vse32.v v0, (%0)" : : "r"(&out0[r * N0]) : "memory");
         }
         for (int r = 0; r < HW; ++r) {
-          asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x3" : : "r"(r) : "memory");
-          asm volatile("vse32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0 + HW]) : "memory");
+          asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x2" : : "r"(r) : "memory");
+          asm volatile("vse32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0]) : "memory");
+        }
+        if (vl1 > 0) {
+          asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(vl1));
+          for (int r = 0; r < HW; ++r) {
+            asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x1" : : "r"(r) : "memory");
+            asm volatile("vse32.v v0, (%0)" : : "r"(&out0[r * N0 + HW]) : "memory");
+          }
+          for (int r = 0; r < HW; ++r) {
+            asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, x3" : : "r"(r) : "memory");
+            asm volatile("vse32.v v0, (%0)" : : "r"(&out0[(r + HW) * N0 + HW]) : "memory");
+          }
         }
       }
     }

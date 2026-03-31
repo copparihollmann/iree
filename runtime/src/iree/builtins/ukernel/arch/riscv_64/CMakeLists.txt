@@ -223,6 +223,8 @@ iree_cc_library(
     "pack_riscv_64_entry_point.c"
     "unpack_riscv_64_entry_point.c"
     "query_tile_sizes_riscv_64_entry_point.c"
+  COPTS
+    "${IREE_UK_COPTS_RISCV_64_V}"
   DEPS
     ::common_riscv_64
     iree::base::core_headers

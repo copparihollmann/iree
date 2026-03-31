@@ -245,6 +245,12 @@ matchDAGForUKernel(RewriterBase &rewriter, linalg::Mmt4DOp op,
     flags |= IREE_UK_FLAG_MMT4D_SKIP_INTERMEDIATE_ROUNDINGS;
   }
 
+  // OPU transposed output: the mmt4d outer loop swaps M<->N and LHS<->RHS
+  // to produce C^T directly, avoiding a separate transpose step.
+  if (op->hasAttr("iree.opu_transposed_output")) {
+    flags |= IREE_UK_FLAG_MMT4D_TRANSPOSED_OUTPUT;
+  }
+
   // TODO(#15784): drop the fallback flag, instead create a iree_uk_mmt4d_info
   // ukernel op to query whether the ukernel has fast code for this case, and
   // preserve the original `linalg.mmt4d` as a fallback in the `else` branch.

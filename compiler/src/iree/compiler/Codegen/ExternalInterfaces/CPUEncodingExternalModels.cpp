@@ -357,6 +357,11 @@ Operation *lowerContractionOpWithEncoding(
         builder, linalgOp.getLoc(), newResultType, ValueRange{newLhs, newRhs},
         ValueRange{newResult});
   }
+  // Propagate OPU transposed-output annotation from the original matmul.
+  if (linalgOp->hasAttr("iree.opu_transposed_output")) {
+    result->setAttr("iree.opu_transposed_output",
+                    builder.getUnitAttr());
+  }
   if (!ri.empty()) {
     result = tensor::CollapseShapeOp::create(builder, linalgOp->getLoc(),
                                              operands[2].getType(),

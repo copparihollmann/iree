@@ -140,6 +140,18 @@ def LinalgQuantizedMatmulToMatmulPass
   let summary = "lower quantized_matmul to matmul";
 }
 
+def FuseTransposeIntoMatmulPass :
+    InterfacePass<"iree-global-opt-fuse-transpose-into-matmul", "mlir::FunctionOpInterface"> {
+  let summary = "Fuses linalg.transpose into preceding linalg.matmul for OPU targets.";
+  let description = [{
+    Detects matmul -> transpose([1,0]) chains and annotates the matmul with
+    an `iree.opu_transposed_output` attribute. Downstream passes (encoding
+    resolver, ukernel lowering) use this annotation to emit mmt4d with the
+    TRANSPOSED_OUTPUT flag, which writes the result in transposed layout
+    directly. Currently limited to square outputs (M == N).
+  }];
+}
+
 def RaiseSpecialOpsPass :
     Pass<"iree-global-opt-raise-special-ops", ""> {
   let summary = "Raises special ops like softmax to the high level linalg.ext representation.";
