@@ -4,6 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include "iree/async/proactor.h"
 #include "iree/async/proactor_platform.h"
 
 #if defined(IREE_PLATFORM_LINUX) && !defined(IREE_PLATFORM_ANDROID)
@@ -41,6 +42,22 @@ iree_status_t iree_async_proactor_create_platform(
   if (iree_status_is_unavailable(status)) {
     iree_status_ignore(status);
     status = iree_async_proactor_create_posix(options, allocator, out_proactor);
+  }
+
+#elif defined(IREE_PLATFORM_GENERIC)
+
+  // Bare-metal: create a minimal no-op proactor. The sync device requires a
+  // non-NULL proactor but never uses it for actual async I/O.
+  iree_async_proactor_t* proactor = NULL;
+  status = iree_allocator_malloc(allocator, sizeof(*proactor), (void**)&proactor);
+  if (iree_status_is_ok(status)) {
+    static const iree_async_proactor_vtable_t nop_vtable = {
+        .destroy = (void (*)(iree_async_proactor_t*))iree_allocator_free,
+    };
+    iree_async_proactor_initialize(&nop_vtable,
+                                   iree_make_cstring_view("nop"),
+                                   allocator, proactor);
+    *out_proactor = proactor;
   }
 
 #elif !defined(IREE_PLATFORM_EMSCRIPTEN)  // macOS, BSD, Android, etc.
