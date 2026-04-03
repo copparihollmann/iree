@@ -19,6 +19,15 @@
 #include "iree/async/platform/iocp/api.h"
 #endif  // IREE_PLATFORM_WINDOWS
 
+#if defined(IREE_PLATFORM_GENERIC)
+static void iree_nop_proactor_destroy(iree_async_proactor_t* proactor) {
+  iree_allocator_free(proactor->allocator, proactor);
+}
+const iree_async_proactor_vtable_t iree_nop_proactor_vtable_instance = {
+    .destroy = iree_nop_proactor_destroy,
+};
+#endif  // IREE_PLATFORM_GENERIC
+
 iree_status_t iree_async_proactor_create_platform(
     iree_async_proactor_options_t options, iree_allocator_t allocator,
     iree_async_proactor_t** out_proactor) {
@@ -48,16 +57,18 @@ iree_status_t iree_async_proactor_create_platform(
 
   // Bare-metal: create a minimal no-op proactor. The sync device requires a
   // non-NULL proactor but never uses it for actual async I/O.
-  iree_async_proactor_t* proactor = NULL;
-  status = iree_allocator_malloc(allocator, sizeof(*proactor), (void**)&proactor);
-  if (iree_status_is_ok(status)) {
-    static const iree_async_proactor_vtable_t nop_vtable = {
-        .destroy = (void (*)(iree_async_proactor_t*))iree_allocator_free,
-    };
-    iree_async_proactor_initialize(&nop_vtable,
-                                   iree_make_cstring_view("nop"),
-                                   allocator, proactor);
-    *out_proactor = proactor;
+  {
+    iree_async_proactor_t* proactor = NULL;
+    status = iree_allocator_malloc(allocator, sizeof(*proactor),
+                                   (void**)&proactor);
+    if (iree_status_is_ok(status)) {
+      extern const iree_async_proactor_vtable_t
+          iree_nop_proactor_vtable_instance;
+      iree_async_proactor_initialize(&iree_nop_proactor_vtable_instance,
+                                     iree_make_cstring_view("nop"),
+                                     allocator, proactor);
+      *out_proactor = proactor;
+    }
   }
 
 #elif !defined(IREE_PLATFORM_EMSCRIPTEN)  // macOS, BSD, Android, etc.
