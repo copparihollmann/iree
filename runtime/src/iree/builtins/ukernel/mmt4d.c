@@ -117,9 +117,9 @@ static bool iree_uk_mmt4d_early(const iree_uk_mmt4d_params_t* params) {
     return true;
   }
   // Targets that want to specialize the entire loop nest can do so here.
-  // TODO: Enable OPU full loop nest after Phase 2 (compiler: identity output
-  // encoding) so out_stride0 reflects 2D layout instead of packed layout.
-#if 0 && defined(IREE_UK_ARCH_RISCV_64)
+  // OPU full loop nest: writes to packed output, same format as standard path.
+  // Benefit: single function (no tile call boundary), tighter register alloc.
+#if defined(IREE_UK_ARCH_RISCV_64)
   if (iree_uk_mmt4d_early_riscv_64_xopu(params)) return true;
 #endif
   return false;

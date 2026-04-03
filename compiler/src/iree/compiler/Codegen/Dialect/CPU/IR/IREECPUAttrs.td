@@ -232,4 +232,23 @@ def IREECPU_VMVXEncodingResolverAttr :
   );
 }
 
+def IREECPU_OPUEncodingResolverAttr :
+    AttrDef<IREECPU_Dialect, "OPUEncodingResolver"> {
+  let mnemonic = "opu_encoding_resolver";
+  let summary = [{The encoding layout attribute for Saturn OPU backend.}];
+  let description = [{
+    OPU-specific encoding resolver that uses identity encoding for matmul
+    results (no packing/unpacking) while keeping packed inputs for contiguous
+    VOPACC loads. Lowers matmul contractions directly to OPU ukernel calls
+    instead of linalg.mmt4d + linalg.unpack.
+  }];
+
+  let assemblyFormat = "`<` struct(params) `>`";
+
+  let parameters = (ins
+    OptionalParameter<"DictionaryAttr", "Executable target configuration. It is "
+    "expected to be used in a pass scope, but not the final IR output.">:$configuration
+  );
+}
+
 #endif // IREE_COMPILER_CODEGEN_DIALECT_CPU_IREECPUATTRS

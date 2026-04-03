@@ -41,18 +41,24 @@
 
 #include "iree/compiler/Codegen/ExternalInterfaces/CPUEncodingExternalModels.h"
 
+#include "iree/builtins/ukernel/exported_bits.h"
 #include "iree/compiler/Codegen/Dialect/CPU/IR/IREECPUTypes.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenTypes.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/UKernelOps.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/Utils/Utils.h"
 #include "iree/compiler/Codegen/ExternalInterfaces/Utils.h"
 #include "iree/compiler/Codegen/Utils/CPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/Encoding/IR/EncodingTypes.h"
 #include "iree/compiler/Dialect/Encoding/Utils/Utils.h"
+#include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/InterleavedRange.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/Matchers.h"
 
 #define DEBUG_TYPE "iree-codegen-materialize-encoding"
 
@@ -1079,6 +1085,246 @@ struct VMVXEncodingResolverVerifier
   }
 };
 
+//===----------------------------------------------------------------------===//
+// Interface methods implementation for iree_cpu.opu_encoding_resolver.
+//===----------------------------------------------------------------------===//
+
+// Helpers for OPU ukernel lowering (duplicated from CPULowerToUKernels.cpp
+// because those are file-local static functions).
+
+/// Returns `true` if an `outsOperand` value is initialized to zero.
+static bool opuIsInitializedToZero(Value outsOperand) {
+  auto fillOp = outsOperand.getDefiningOp<linalg::FillOp>();
+  if (!fillOp) {
+    return false;
+  }
+  Value fillVal = fillOp.getDpsInputOperand(0)->get();
+  return matchPattern(fillVal, m_Zero()) ||
+         matchPattern(fillVal, m_AnyZeroFloat());
+}
+
+/// Creates a UKernelGenericOp for the OPU matmul contraction.
+/// Takes packed LHS/RHS inputs and produces 2D output directly.
+static Operation *lowerOPUContractionToUkernel(
+    OpBuilder &b, linalg::LinalgOp linalgOp, ValueRange convertedOperands) {
+  Location loc = linalgOp.getLoc();
+
+  // convertedOperands layout:
+  //   [0] = packed LHS (e.g., tensor<?x?x32x1xi8>)
+  //   [1] = packed RHS (e.g., tensor<?x?x32x1xi8>)
+  //   [2] = 2D output  (tensor<?x?xi32>, identity encoding)
+  Value packedLHS = convertedOperands[0];
+  Value packedRHS = convertedOperands[1];
+  Value output2D = convertedOperands[2];
+
+  auto lhsType = cast<RankedTensorType>(packedLHS.getType());
+  auto rhsType = cast<RankedTensorType>(packedRHS.getType());
+  auto outType = cast<ShapedType>(output2D.getType());
+
+  // Extract tile counts (dynamic) and tile sizes (static) from packed shapes.
+  // LHS shape: [M, K, M0, K0]
+  // RHS shape: [N, K, N0, K0]
+  Value M = tensor::DimOp::create(b, loc, packedLHS, 0);
+  Value K = tensor::DimOp::create(b, loc, packedLHS, 1);
+  Value N = tensor::DimOp::create(b, loc, packedRHS, 0);
+
+  auto getDimAsI32 = [](OpBuilder &b, Location loc, Value value,
+                        int dim) -> Value {
+    return arith::IndexCastOp::create(
+        b, loc, b.getI32Type(), tensor::DimOp::create(b, loc, value, dim));
+  };
+  Value M0 = getDimAsI32(b, loc, packedLHS, 2);
+  Value N0 = getDimAsI32(b, loc, packedRHS, 2);
+  Value K0 = getDimAsI32(b, loc, packedRHS, 3);
+
+  // Build flags.
+  uint32_t flags = IREE_UK_FLAG_MMT4D_TYPE_S8S8S32;
+
+  // Check if the accumulator is zero-filled.
+  Value ukernelOut = output2D;
+  if (opuIsInitializedToZero(output2D)) {
+    // Output is zero-initialized; skip accumulate flag and use the fill's init.
+    if (auto fillOp = output2D.getDefiningOp<linalg::FillOp>()) {
+      ukernelOut = fillOp.getDpsInitOperand(0)->get();
+    }
+  } else {
+    flags |= IREE_UK_FLAG_MMT4D_ACCUMULATE;
+  }
+
+  flags |= IREE_UK_FLAG_MMT4D_ALLOW_GENERIC_FALLBACK_TILE_FUNCTION;
+
+  Value flagsVal =
+      arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(flags));
+
+  // Build function name and def attrs for the OPU ukernel.
+  std::string fnName = "iree_uk_opu_matmul";
+  SmallVector<NamedAttribute> defAttrs;
+  defAttrs.emplace_back(b.getStringAttr("hal.import.fields"),
+                        b.getArrayAttr({b.getStringAttr("processor_data")}));
+  defAttrs.emplace_back(b.getStringAttr("hal.import.bitcode"),
+                        b.getBoolAttr(true));
+
+  // Return types: tensor result + i32 dummy (llvm-cpu void-return workaround).
+  // After bufferization the tensor result disappears, leaving only the i32.
+  SmallVector<Type> returnTypes{outType,
+                                IntegerType::get(b.getContext(), 32)};
+
+  auto genericOp = IREE::Codegen::UKernelGenericOp::create(
+      b, loc, returnTypes, fnName, ValueRange{packedLHS, packedRHS},
+      ukernelOut, ValueRange{M, N, K, M0, N0, K0, flagsVal},
+      /*fn_def_attrs=*/b.getDictionaryAttr(defAttrs),
+      /*num_strided_outer_dims=*/1);
+
+  // MaterializeLinalgOp::matchAndRewrite does:
+  //   rewriter.replaceOp(matmulOp, newOp->getResults())
+  // The original matmul has 1 result, but UKernelGenericOp has 2 (tensor +
+  // i32 dummy). We need to return a 1-result op for the replacement.
+  // Use tensor.cast (identity) to forward just the tensor result.
+  auto castOp = tensor::CastOp::create(b, loc, outType,
+                                        genericOp.getResult(0));
+  return castOp.getOperation();
+}
+
+struct OPUEncodingPackedLayoutMaterializerAttr final
+    : PackedLayoutMaterializerAttrExternalModelBase<
+          OPUEncodingPackedLayoutMaterializerAttr, OPUEncodingResolverAttr> {
+
+  DictionaryAttr getConfiguration(Attribute attr) const {
+    return cast<OPUEncodingResolverAttr>(attr).getConfiguration();
+  }
+
+  MaterializeEncodingInfo getEncodingInfoImpl(Attribute attr,
+                                              RankedTensorType type) const {
+    auto layoutAttr = cast<OPUEncodingResolverAttr>(attr);
+
+    auto encoding =
+        dyn_cast_if_present<IREE::Encoding::EncodingAttr>(type.getEncoding());
+
+    MaterializeEncodingInfo info;
+    if (!encoding) {
+      return info;
+    }
+
+    // RESULT operand gets identity encoding (no packing, no unpack needed).
+    if (encoding.getOperandIndex().getValue() ==
+        IREE::Encoding::MATMUL_RESULT) {
+      return info; // Empty = identity layout
+    }
+
+    // LHS/RHS: use OPU hardware-width tiles (16x16) that are compatible
+    // with both the OPU VOPACC hardware and pack dispatch codegen.
+    // The larger tiles (32x32, 64x64) from enumerateCPUMatmulTiles are
+    // designed for the ukernel path and cause vectorization issues in pack
+    // codegen on RISC-V V128.
+    auto cDims = getEncodingContractionDims(encoding);
+    if (failed(cDims) || cDims->batch.size() > 1 || cDims->m.size() > 1 ||
+        cDims->n.size() > 1 || cDims->k.size() > 1) {
+      return info;
+    }
+
+    // OPU tiles matching saturn-vectors opu-2x2-gemm: 2x2 sub-tiling with
+    // m0-m3 matrix registers for 32x32 blocks, 4x4 for 64x64.
+    // The ukernel handles the 16x16 hardware tiling internally.
+    SmallVector<TileMxNxK> opuTiles = {
+        TileMxNxK{64, 64, 1}, // 4x4 sub-tiling (preferred for large matrices)
+        TileMxNxK{32, 32, 1}, // 2x2 sub-tiling
+        TileMxNxK{16, 16, 1}, // Single OPU hardware tile
+        TileMxNxK{8, 16, 1},  // Narrow-M
+        TileMxNxK{1, 16, 1},  // Vecmat
+    };
+    auto narrowDim = IREE::Encoding::getPo2MatmulNarrowDim(encoding);
+    TileMxNxK chosenTileMxNxK = chooseMatmulTile(opuTiles, narrowDim);
+    FailureOr<MaterializeEncodingInfo> maybeEncodingInfo =
+        getEncodingInfoForMatmul(encoding, chosenTileMxNxK);
+    if (failed(maybeEncodingInfo)) {
+      return info;
+    }
+    info = std::move(maybeEncodingInfo.value());
+    return info;
+  }
+};
+
+struct OPUEncodingResolverMaterializerAttr final
+    : EncodingLayoutMaterializerAttrExternalModelBase<
+          OPUEncodingResolverMaterializerAttr, OPUEncodingResolverAttr> {
+
+  Operation *lowerOp(Attribute attr, OpBuilder &b, Operation *op,
+                     TypeRange convertedResTypes,
+                     ValueRange convertedOperands) const {
+    auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+    if (!linalgOp) {
+      return nullptr;
+    }
+    if (auto fillOp = dyn_cast<linalg::FillOp>(op)) {
+      return lowerFillOpWithResolvedLayouts(b, fillOp, convertedResTypes,
+                                            convertedOperands);
+    }
+    if (linalg::isaContractionOpInterface(linalgOp)) {
+      return lowerOPUContractionToUkernel(b, linalgOp, convertedOperands);
+    }
+    if (auto genericOp = dyn_cast<linalg::GenericOp>(op)) {
+      return lowerGenericOpWithResolvedLayouts(
+          b, genericOp, convertedResTypes, convertedOperands,
+          cast<IREE::Encoding::LayoutMaterializerAttr>(attr));
+    }
+    return nullptr;
+  }
+};
+
+struct OPULayoutResolverAttr final
+    : IREE::Encoding::LayoutResolverAttr::ExternalModel<
+          OPULayoutResolverAttr, OPUEncodingResolverAttr> {
+  Attribute cloneWithSimplifiedConfig(Attribute attr,
+                                      DictionaryAttr config) const {
+    MLIRContext *ctx = attr.getContext();
+    SmallVector<NamedAttribute> configItems;
+    if (std::optional<StringRef> cpuFeatures = getConfigCpuFeatures(config)) {
+      addConfigCpuFeatures(ctx, cpuFeatures.value(), configItems);
+    }
+    if (std::optional<StringRef> targetTriple = getConfigTargetTriple(config)) {
+      addConfigTargetTriple(ctx, targetTriple.value(), configItems);
+    }
+    storeNamedAttrIfPresent(configItems, config, "ukernels");
+    return OPUEncodingResolverAttr::get(ctx,
+                                        DictionaryAttr::get(ctx, configItems));
+  }
+
+  Attribute getLayout(Attribute attr, RankedTensorType type) const {
+    MLIRContext *ctx = attr.getContext();
+    return OPUEncodingResolverAttr::get(ctx, getPackedLayoutImpl(attr, type));
+  }
+};
+
+struct OPUSerializableAttr final
+    : IREE::Encoding::SerializableAttr::ExternalModel<OPUSerializableAttr,
+                                                      OPUEncodingResolverAttr> {
+  bool isSerialized(Attribute attr) const {
+    auto configuration =
+        cast<OPUEncodingResolverAttr>(attr).getConfiguration();
+    return configuration && configuration.contains(kEncodingInfoAttrName);
+  }
+
+  Value calculateStorageSizeInBytes(Attribute attr, Location loc,
+                                    OpBuilder &builder, RankedTensorType type,
+                                    ValueRange dynamicDims) const {
+    return calculatePackedStorageSizeInBytesImpl(attr, loc, builder, type,
+                                                 dynamicDims);
+  }
+};
+
+struct OPUEncodingResolverVerifier
+    : mlir::VerifiableTensorEncoding::ExternalModel<OPUEncodingResolverVerifier,
+                                                    OPUEncodingResolverAttr> {
+  LogicalResult
+  verifyEncoding(Attribute attr, ArrayRef<int64_t> shape, Type elementType,
+                 function_ref<InFlightDiagnostic()> emitError) const {
+    auto packedLayoutMaterializerAttr =
+        cast<Codegen::PackedLayoutMaterializerAttr>(attr);
+    return packedLayoutMaterializerAttr.verifyPackedLayoutWithType(
+        shape, elementType, emitError);
+  }
+};
+
 } // namespace
 
 void registerCPUEncodingExternalModels(DialectRegistry &registry) {
@@ -1092,6 +1338,10 @@ void registerCPUEncodingExternalModels(DialectRegistry &registry) {
             VMVXEncodingPackedLayoutMaterializerAttr,
             VMVXEncodingResolverMaterializerAttr, VMVXLayoutResolverAttr,
             VMVXSerializableAttr, VMVXEncodingResolverVerifier>(*ctx);
+        IREE::CPU::OPUEncodingResolverAttr::attachInterface<
+            OPUEncodingPackedLayoutMaterializerAttr,
+            OPUEncodingResolverMaterializerAttr, OPULayoutResolverAttr,
+            OPUSerializableAttr, OPUEncodingResolverVerifier>(*ctx);
       });
 }
 

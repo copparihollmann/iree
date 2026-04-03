@@ -174,9 +174,19 @@ public:
     Builder b(context);
     SmallVector<NamedAttribute> configItems;
     target.storeToConfigAttrs(context, configItems);
-    configItems.emplace_back(
-        b.getStringAttr(IREE::Encoding::kEncodingResolverAttrName),
-        IREE::CPU::CPUEncodingResolverAttr::get(context, {}));
+    {
+      Attribute encodingResolver;
+      if (target.getCpuFeatures().find("+xopu") != std::string::npos) {
+        encodingResolver =
+            IREE::CPU::OPUEncodingResolverAttr::get(context, {});
+      } else {
+        encodingResolver =
+            IREE::CPU::CPUEncodingResolverAttr::get(context, {});
+      }
+      configItems.emplace_back(
+          b.getStringAttr(IREE::Encoding::kEncodingResolverAttrName),
+          encodingResolver);
+    }
 
     // Compute the format used at runtime to select the executable loader.
     std::string format;
