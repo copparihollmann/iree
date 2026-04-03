@@ -48,6 +48,8 @@ iree_bitcode_library(
   SRCS
     "mmt4d_riscv_64_v.c"
     "mmt4d_riscv_64_v_i8.c"
+    "mmt4d_riscv_64_xopu.c"
+    "opu_matmul_riscv_64.c"
   COPTS
     "-march=rv64gcv"
 )
@@ -179,6 +181,8 @@ iree_cc_library(
   SRCS
     "mmt4d_riscv_64_v.c"
     "mmt4d_riscv_64_v_i8.c"
+    "mmt4d_riscv_64_xopu.c"
+    "opu_matmul_riscv_64.c"
   COPTS
     "${IREE_UK_COPTS_RISCV_64_V}"
   DEPS

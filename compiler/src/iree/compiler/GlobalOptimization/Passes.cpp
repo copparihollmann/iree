@@ -137,6 +137,9 @@ void buildGlobalOptimizationPassPipeline(
       // optimizations, is sensitive to surrounding IR structure. Thus we run
       // this pass both before unit dim folding + consteval, as well as after.
       .addPass(createRaiseSpecialOpsPass)
+      // Fuse transpose into matmul for OPU targets. Must run before
+      // GeneralizeLinalgNamedOps converts linalg.matmul to linalg.generic.
+      .addPass(createFuseTransposeIntoMatmulPass)
       // We decompose and transpose concatenations immediately before folding
       // unit extent dims because this allows decoupling unit dims in the
       // concatenation from the transposes that are introduced.

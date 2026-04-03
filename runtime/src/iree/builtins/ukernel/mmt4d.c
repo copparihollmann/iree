@@ -9,12 +9,19 @@
 #include "iree/builtins/ukernel/exported_bits.h"
 #include "iree/builtins/ukernel/mmt4d_internal.h"
 
+// Architecture-specific early handlers for full loop nest specialization.
+#if defined(IREE_UK_ARCH_RISCV_64)
+extern bool iree_uk_mmt4d_early_riscv_64_xopu(
+    const iree_uk_mmt4d_params_t* params);
+#endif
+
 static void iree_uk_mmt4d_validate(const iree_uk_mmt4d_params_t* params) {
 #ifdef IREE_UK_ENABLE_ASSERTS
   const iree_uk_uint32_t allflags =
       IREE_UK_FLAG_MMT4D_TYPE_MASK | IREE_UK_FLAG_MMT4D_ACCUMULATE |
       IREE_UK_FLAG_MMT4D_SKIP_INTERMEDIATE_ROUNDINGS |
-      IREE_UK_FLAG_MMT4D_ALLOW_GENERIC_FALLBACK_TILE_FUNCTION;
+      IREE_UK_FLAG_MMT4D_ALLOW_GENERIC_FALLBACK_TILE_FUNCTION |
+      IREE_UK_FLAG_MMT4D_TRANSPOSED_OUTPUT;
   IREE_UK_ASSERT(!(params->flags & ~allflags));
   iree_uk_uint32_t flags_type = params->flags & IREE_UK_FLAG_MMT4D_TYPE_MASK;
   IREE_UK_ASSERT(flags_type < IREE_UK_FLAG_MMT4D_TYPE_END);
@@ -110,6 +117,11 @@ static bool iree_uk_mmt4d_early(const iree_uk_mmt4d_params_t* params) {
     return true;
   }
   // Targets that want to specialize the entire loop nest can do so here.
+  // OPU full loop nest: writes to packed output, same format as standard path.
+  // Benefit: single function (no tile call boundary), tighter register alloc.
+#if defined(IREE_UK_ARCH_RISCV_64)
+  if (iree_uk_mmt4d_early_riscv_64_xopu(params)) return true;
+#endif
   return false;
 }
 

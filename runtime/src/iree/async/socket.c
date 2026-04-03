@@ -4,6 +4,11 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include "iree/base/target_platform.h"
+
+// Sockets are not available on bare-metal targets.
+#if !defined(IREE_PLATFORM_GENERIC)
+
 #include "iree/async/socket.h"
 
 #include "iree/async/proactor.h"
@@ -345,3 +350,5 @@ IREE_API_EXPORT iree_status_t iree_async_socket_query_send_space(
   // out_space is already set to IREE_HOST_SIZE_MAX.
   return iree_ok_status();
 }
+
+#endif  // !IREE_PLATFORM_GENERIC

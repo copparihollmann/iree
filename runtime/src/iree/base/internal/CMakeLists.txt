@@ -229,7 +229,7 @@ iree_cc_library(
     "dynamic_library_posix.c"
     "dynamic_library_win32.c"
   DEPS
-    ${CMAKE_DL_LIBS}
+    $<$<BOOL:${IREE_ENABLE_THREADING}>:${CMAKE_DL_LIBS}>
     ::internal
     ::path
     iree::base
