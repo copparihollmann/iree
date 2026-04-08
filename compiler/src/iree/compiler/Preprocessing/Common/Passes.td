@@ -78,6 +78,24 @@ def ConvertConvToChannelsLastPass :
   ];
 }
 
+// ===== Saturn OPU (+xopu) =====
+def CollapseMultiNContractionsPass :
+    Pass<"iree-preprocessing-collapse-multi-n-contractions", ""> {
+  let summary = "Collapse multi-N contractions into standard 2D matmuls.";
+  let description = [{
+    Detects linalg.generic contractions with multiple N dimensions (e.g.,
+    QKV multi-head projections: [M,K] x [K,H,D] -> [H,M,D]) and collapses
+    them into standard 2D matmuls by reshaping the RHS to flatten H*D, then
+    expanding+transposing the result back. This enables the data-tiling
+    encoding pipeline (which requires single M,N,K dims) to apply OPU
+    VOPACC acceleration to these matmuls.
+  }];
+  let dependentDialects = [
+    "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect",
+  ];
+}
+
 def FoldAttentionWithTransposePass :
     Pass<"iree-preprocessing-fold-attention-with-transpose", ""> {
   let summary = "Fold attention operation with transpose";
