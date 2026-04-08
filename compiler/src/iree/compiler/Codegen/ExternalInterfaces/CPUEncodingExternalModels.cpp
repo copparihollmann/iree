@@ -335,11 +335,17 @@ Operation *lowerContractionOpWithEncoding(
                                   operands.drop_front(inputs.size()));
   }
 
+  auto cDims = IREE::Encoding::getEncodingContractionDims(lhsEncoding);
   bool transpose = isNarrowNResult(resultEncoding);
   // Do not transpose in case we have scalable tiles.
   transpose &= llvm::none_of(
       encodingInfo.scalableTiles.value_or(IREE::Codegen::ScalableTileFlags{}),
       [](bool flag) { return flag; });
+  // Batch matmuls: never transpose. Transposing swaps LHS/RHS operands but
+  // not the Result, which breaks batch_mmt4d dimension verification when M!=N.
+  if (succeeded(cDims) && !cDims->batch.empty()) {
+    transpose = false;
+  }
   SmallVector<Type> elemTypes = lhsEncoding.getElementTypesArray();
   SmallVector<ReassociationIndices> ri;
   Value newLhs = getMmt4dOperand(operands[0], linalgOp, transpose, builder, ri,
@@ -352,9 +358,8 @@ Operation *lowerContractionOpWithEncoding(
     std::swap(newLhs, newRhs);
   }
   Type newResultType = newResult.getType();
-  auto cDims = IREE::Encoding::getEncodingContractionDims(lhsEncoding);
   Operation *result;
-  if (cDims->batch.empty()) {
+  if (failed(cDims) || cDims->batch.empty()) {
     result = linalg::Mmt4DOp::create(builder, linalgOp.getLoc(), newResultType,
                                      ValueRange{newLhs, newRhs},
                                      ValueRange{newResult});
@@ -509,15 +514,16 @@ enumerateMatmulTileRiscv64(TypeRange elementTypes, DictionaryAttr config) {
   if (lhs.isSignlessInteger(8) && rhs.isSignlessInteger(8) &&
       out.isSignlessInteger(32)) {
 
-    // Saturn OPU: M0=N0=VLEN/2 preferred (64 on V128). K0=1 for
-    // contiguous loads in the ukernel (no encoding swap needed).
+    // Saturn OPU: 16×16 hardware tiles. Limit encoding tiles to 16×16 max
+    // to avoid oversized vectors during vectorization on V128.
+    // The OPU ukernel internally handles larger effective tiles (32×32, 64×64)
+    // via 2×2/4×4 sub-tiling at runtime.
     if (hasFeature(config, "+xopu")) {
       int N0 = std::min<int>(16, vlen / 8);  // e8, m1 lanes = 16 on V128
       return {
-          TileMxNxK{4 * N0, 4 * N0, 1},  // 64x64: preferred (VLEN/2)
-          TileMxNxK{2 * N0, 2 * N0, 1},  // 32x32: 2x2 tiling
-          TileMxNxK{N0, N0, 1},           // 16x16: 1x1 fallback
+          TileMxNxK{N0, N0, 1},           // 16x16: OPU hardware tile
           TileMxNxK{N0 / 2, N0, 1},       // 8x16: narrow-M
+          TileMxNxK{N0 / 4, N0, 1},       // 4x16: narrower-M
           TileMxNxK{1, N0, 1},            // 1x16: vecmat
       };
     }
@@ -1085,9 +1091,28 @@ struct VMVXEncodingResolverVerifier
   }
 };
 
+// ===== Saturn OPU (+xopu) BEGIN =====
 //===----------------------------------------------------------------------===//
 // Interface methods implementation for iree_cpu.opu_encoding_resolver.
 //===----------------------------------------------------------------------===//
+
+/// Resilient fallback: clone the op with convertedOperands and
+/// convertedResTypes, stripping any remaining encoding from the IR.
+/// Used when all encoding-aware lowering paths fail (e.g., im2col shapes).
+static Operation *dropAllEncodingsAndClone(OpBuilder &builder, Operation *op,
+                                           ValueRange convertedOperands,
+                                           TypeRange convertedResTypes) {
+  // Strip encoding from result types.
+  SmallVector<Type> strippedResTypes;
+  for (auto type : convertedResTypes) {
+    if (auto rtt = dyn_cast<RankedTensorType>(type)) {
+      strippedResTypes.push_back(rtt.dropEncoding());
+    } else {
+      strippedResTypes.push_back(type);
+    }
+  }
+  return mlir::clone(builder, op, strippedResTypes, convertedOperands);
+}
 
 // Helpers for OPU ukernel lowering (duplicated from CPULowerToUKernels.cpp
 // because those are file-local static functions).
@@ -1120,6 +1145,13 @@ static Operation *lowerOPUContractionToUkernel(
   auto lhsType = cast<RankedTensorType>(packedLHS.getType());
   auto rhsType = cast<RankedTensorType>(packedRHS.getType());
   auto outType = cast<ShapedType>(output2D.getType());
+
+  // The OPU ukernel expects 4D packed inputs [M, K, M0, K0] / [N, K, N0, K0].
+  // If the encoding produced different ranks (e.g., vecmat with identity LHS,
+  // or CPU-style tiles), bail out to the standard contraction path.
+  if (lhsType.getRank() != 4 || rhsType.getRank() != 4) {
+    return nullptr;
+  }
 
   // Extract tile counts (dynamic) and tile sizes (static) from packed shapes.
   // LHS shape: [M, K, M0, K0]
@@ -1205,42 +1237,95 @@ struct OPUEncodingPackedLayoutMaterializerAttr final
       return info;
     }
 
-    // RESULT operand gets identity encoding (no packing, no unpack needed).
-    if (encoding.getOperandIndex().getValue() ==
-        IREE::Encoding::MATMUL_RESULT) {
-      return info; // Empty = identity layout
-    }
-
-    // LHS/RHS: use OPU hardware-width tiles (16x16) that are compatible
-    // with both the OPU VOPACC hardware and pack dispatch codegen.
-    // The larger tiles (32x32, 64x64) from enumerateCPUMatmulTiles are
-    // designed for the ukernel path and cause vectorization issues in pack
-    // codegen on RISC-V V128.
     auto cDims = getEncodingContractionDims(encoding);
-    if (failed(cDims) || cDims->batch.size() > 1 || cDims->m.size() > 1 ||
+    if (failed(cDims) || cDims->m.size() > 1 ||
         cDims->n.size() > 1 || cDims->k.size() > 1) {
       return info;
     }
 
-    // OPU tiles matching saturn-vectors opu-2x2-gemm: 2x2 sub-tiling with
-    // m0-m3 matrix registers for 32x32 blocks, 4x4 for 64x64.
-    // The ukernel handles the 16x16 hardware tiling internally.
-    SmallVector<TileMxNxK> opuTiles = {
-        TileMxNxK{64, 64, 1}, // 4x4 sub-tiling (preferred for large matrices)
-        TileMxNxK{32, 32, 1}, // 2x2 sub-tiling
-        TileMxNxK{16, 16, 1}, // Single OPU hardware tile
-        TileMxNxK{8, 16, 1},  // Narrow-M
-        TileMxNxK{1, 16, 1},  // Vecmat
-    };
+    // Batch matmuls (attention QKV) and vecmat/matvec need CPU tile fallback.
+    // OPU tiles only work for 2D non-batched matmuls with M,N >= 2.
     auto narrowDim = IREE::Encoding::getPo2MatmulNarrowDim(encoding);
-    TileMxNxK chosenTileMxNxK = chooseMatmulTile(opuTiles, narrowDim);
-    FailureOr<MaterializeEncodingInfo> maybeEncodingInfo =
-        getEncodingInfoForMatmul(encoding, chosenTileMxNxK);
-    if (failed(maybeEncodingInfo)) {
+    bool isNarrowOne = narrowDim && narrowDim.size == 1;
+    bool hasBatch = !cDims->batch.empty();
+
+    // For batch matmuls and vecmat: use the same OPU 16x16 tiles as
+    // standard matmuls (not identity, not CPU-specific tiles). This ensures
+    // consistent tile sizes across LHS, RHS, and result operands, avoiding
+    // batch_mmt4d shape mismatches. The batch dimension is preserved as-is
+    // by getEncodingInfoForMatmul (only M, N, K dimensions get tiled).
+    if (hasBatch) {
+      // Batch matmuls: use OPU 16×16 tiles for all operands.
+      // Skip narrowDim to keep tiles consistent across operands.
+      SmallVector<TileMxNxK> opuTiles = {
+          TileMxNxK{16, 16, 1},
+          TileMxNxK{8, 16, 1},
+          TileMxNxK{4, 16, 1},
+          TileMxNxK{1, 16, 1},
+      };
+      // Do NOT use narrowDim for batch matmuls — it causes inconsistent
+      // tile selection across operands, producing batch_mmt4d mismatches.
+      IREE::Encoding::MatmulNarrowDim noNarrow;  // default: Dim::None
+      TileMxNxK chosenTile = chooseMatmulTile(opuTiles, noNarrow);
+      auto tileInfo = getEncodingInfoForMatmul(encoding, chosenTile);
+      if (failed(tileInfo)) return info;
+      return std::move(tileInfo.value());
+    }
+    if (isNarrowOne) {
+      SmallVector<TileMxNxK> opuTiles = {
+          TileMxNxK{16, 16, 1},
+          TileMxNxK{8, 16, 1},
+          TileMxNxK{4, 16, 1},
+          TileMxNxK{1, 16, 1},
+      };
+      TileMxNxK chosenTile = chooseMatmulTile(opuTiles, narrowDim);
+      auto tileInfo = getEncodingInfoForMatmul(encoding, chosenTile);
+      if (failed(tileInfo)) return info;
+      return std::move(tileInfo.value());
+    }
+
+    {
+      // Standard matmul (M >= 2, N >= 2): use OPU efficient path.
+      // RESULT: identity encoding (no packing, ukernel writes 2D directly).
+      if (encoding.getOperandIndex().getValue() ==
+          IREE::Encoding::MATMUL_RESULT) {
+        return info; // Empty = identity layout
+      }
+
+      // LHS/RHS: OPU hardware-width tiles. The OPU operates on 16×16
+      // matrix registers; larger tiles (32×32, 64×64) use 2×2/4×4 sub-tiling
+      // in the ukernel but produce large intermediate vectors during
+      // vectorization. Limit to 16×16 for encoding to avoid oversized vectors
+      // on V128 targets. The ukernel internally handles larger effective tiles.
+      SmallVector<TileMxNxK> opuTiles = {
+          TileMxNxK{16, 16, 1}, // OPU hardware tile
+          TileMxNxK{8, 16, 1},  // Narrow-M
+          TileMxNxK{4, 16, 1},  // Narrower-M
+          TileMxNxK{1, 16, 1},  // Vecmat
+      };
+      TileMxNxK chosenTileMxNxK = chooseMatmulTile(opuTiles, narrowDim);
+      FailureOr<MaterializeEncodingInfo> maybeEncodingInfo =
+          getEncodingInfoForMatmul(encoding, chosenTileMxNxK);
+      if (failed(maybeEncodingInfo)) {
+        return info;
+      }
+      return std::move(maybeEncodingInfo.value());
+    }
+
+    // Batch matmul or vecmat/matvec: fall back to CPU tile enumeration.
+    // CPU tiles properly handle batch dims and K > 1 for non-trivial packing.
+    SmallVector<TileMxNxK> cpuTiles =
+        enumerateCPUMatmulTiles(encoding, layoutAttr.getConfiguration());
+    if (cpuTiles.empty()) {
       return info;
     }
-    info = std::move(maybeEncodingInfo.value());
-    return info;
+    TileMxNxK cpuTile = chooseMatmulTile(cpuTiles, narrowDim);
+    FailureOr<MaterializeEncodingInfo> cpuInfo =
+        getEncodingInfoForMatmul(encoding, cpuTile);
+    if (failed(cpuInfo)) {
+      return info;
+    }
+    return std::move(cpuInfo.value());
   }
 };
 
@@ -1260,14 +1345,54 @@ struct OPUEncodingResolverMaterializerAttr final
                                             convertedOperands);
     }
     if (linalg::isaContractionOpInterface(linalgOp)) {
-      return lowerOPUContractionToUkernel(b, linalgOp, convertedOperands);
+      // Try OPU ukernel lowering first. If it returns null (e.g., unsupported
+      // shape or ukernels disabled), fall through to the standard CPU
+      // contraction lowering with mmt4d.
+      if (auto *ukOp =
+              lowerOPUContractionToUkernel(b, linalgOp, convertedOperands)) {
+        return ukOp;
+      }
+      if (auto *cpuOp = lowerContractionOpWithEncoding(
+              b, linalgOp, convertedOperands,
+              cast<IREE::Encoding::LayoutMaterializerAttr>(attr))) {
+        return cpuOp;
+      }
+      // If both OPU and CPU contraction lowering fail, drop encoding.
+      int64_t numInputs = linalgOp.getNumDpsInputs();
+      int64_t numInits = linalgOp.getNumDpsInits();
+      if (numInputs + numInits == (int64_t)convertedOperands.size()) {
+        return dropEncodingAndCloneOp(b, op,
+                                      convertedOperands.take_front(numInputs),
+                                      convertedOperands.drop_front(numInputs));
+      }
+      // Operand count mismatch (e.g., im2col-generated shapes). Use resilient
+      // fallback that clones with converted operands/types directly.
+      return dropAllEncodingsAndClone(b, op, convertedOperands,
+                                      convertedResTypes);
     }
     if (auto genericOp = dyn_cast<linalg::GenericOp>(op)) {
-      return lowerGenericOpWithResolvedLayouts(
-          b, genericOp, convertedResTypes, convertedOperands,
-          cast<IREE::Encoding::LayoutMaterializerAttr>(attr));
+      if (auto *lowered = lowerGenericOpWithResolvedLayouts(
+              b, genericOp, convertedResTypes, convertedOperands,
+              cast<IREE::Encoding::LayoutMaterializerAttr>(attr))) {
+        return lowered;
+      }
+      // Fallback for elementwise generics that carry encoding attributes
+      // (e.g. dequant/requant/bias-add fused with matmul in QDQ models).
+      // Drop encoding and clone as-is.
+      int64_t numInputs = linalgOp.getNumDpsInputs();
+      int64_t numInits = linalgOp.getNumDpsInits();
+      if (numInputs + numInits == (int64_t)convertedOperands.size()) {
+        return dropEncodingAndCloneOp(b, op,
+                                      convertedOperands.take_front(numInputs),
+                                      convertedOperands.drop_front(numInputs));
+      }
+      // Operand count mismatch: resilient fallback.
+      return dropAllEncodingsAndClone(b, op, convertedOperands,
+                                      convertedResTypes);
     }
-    return nullptr;
+    // Catch-all: never return nullptr from the materializer.
+    return dropAllEncodingsAndClone(b, op, convertedOperands,
+                                    convertedResTypes);
   }
 };
 
@@ -1324,6 +1449,7 @@ struct OPUEncodingResolverVerifier
         shape, elementType, emitError);
   }
 };
+// ===== Saturn OPU (+xopu) END =====
 
 } // namespace
 

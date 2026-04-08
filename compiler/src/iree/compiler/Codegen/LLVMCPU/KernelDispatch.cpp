@@ -12,6 +12,7 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenInterfaces.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenTypes.h"
 #include "iree/compiler/Codegen/Interfaces/PartitionableLoopsInterface.h"
+#include "iree/compiler/Codegen/Interfaces/UKernelOpInterface.h"
 #include "iree/compiler/Codegen/LLVMCPU/TargetMLTransformInfo.h"
 #include "iree/compiler/Codegen/LLVMCPU/Utils.h"
 #include "iree/compiler/Codegen/Utils/CPUUtils.h"
@@ -1647,7 +1648,11 @@ static bool getMatmulOPUVectorSizes(mlir::FunctionOpInterface entryPointFn,
 
   FailureOr<linalg::ContractionDimensions> cDims =
       linalg::inferContractionDims(op);
-  if (failed(cDims) || cDims->m.size() != 1) {
+  // Only handle standard matmul-like contractions with single M, N dims.
+  // Multi-N/multi-M contractions get identity encoding and should use
+  // generic RVV vector sizes to avoid oversized vectors (K0=128 is too
+  // large for non-mmt4d vectorization on V128 targets).
+  if (failed(cDims) || cDims->m.size() != 1 || cDims->n.size() != 1) {
     return false;
   }
 
@@ -4331,6 +4336,15 @@ lowerUsingDefaultPipeline(mlir::FunctionOpInterface entryPointFn) {
 static bool shouldSetLoweringConfig(Operation *op) {
   if (isa_and_nonnull<IREE::LinalgExt::CustomOp>(op->getParentOp()) &&
       getLoweringConfig(op) != nullptr) {
+    return false;
+  }
+
+  // ===== Saturn OPU (+xopu) =====
+  // UKernel ops that don't implement TilingInterface cannot have lowering
+  // configs set via the standard tile-size computation path. Skip them to
+  // avoid cast<TilingInterface> failures in getDefaultDistributedLevelTileSizes.
+  if (isa<IREE::Codegen::UKernelOpInterface>(op) &&
+      !isa<TilingInterface>(op)) {
     return false;
   }
 

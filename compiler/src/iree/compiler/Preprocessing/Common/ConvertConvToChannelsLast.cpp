@@ -355,13 +355,16 @@ transposeConvLikeLinalgOp(PatternRewriter &rewriter, linalg::LinalgOp convOp,
     return failure();
   }
 
-  Value input = convOp->getOperand(0);
-  Value filter = convOp->getOperand(1);
-  Value output = convOp->getOperand(2);
+  Value input = convOp.getDpsInputOperand(0)->get();
+  Value filter = convOp.getDpsInputOperand(1)->get();
+  Value output = convOp.getDpsInitOperand(0)->get();
 
-  auto inputMap = convOp.getIndexingMapsArray()[0];
-  auto filterMap = convOp.getIndexingMapsArray()[1];
-  auto outputMap = convOp.getIndexingMapsArray()[2];
+  // Use the indexing maps for the first two DPS inputs and the first DPS init.
+  // For quantized convs (_q variants), there are extra scalar input operands
+  // (zero points) between filter and output that we skip here.
+  auto inputMap = convOp.getMatchingIndexingMap(convOp.getDpsInputOperand(0));
+  auto filterMap = convOp.getMatchingIndexingMap(convOp.getDpsInputOperand(1));
+  auto outputMap = convOp.getMatchingIndexingMap(convOp.getDpsInitOperand(0));
 
   SmallVector<int64_t> inputIndices =
       collectChannelInnerDimsIndices(inputMap, convDims.inputChannel);
@@ -446,7 +449,40 @@ namespace {
 // Convolution packing patterns
 //=====================================================================
 
+// Named quantized conv builder: NCHW_Q → NHWC_Q preserving zero points.
+template <typename sourceNamedConvTy, typename targetNamedConvTy>
+static Value
+namedQuantizedConvBuilderFn(OpBuilder &b, Location loc,
+                            linalg::LinalgOp srcConv, Value input,
+                            Value filter, Value output, AffineMap inputMap,
+                            AffineMap filterMap, AffineMap outputMap,
+                            SmallVector<unsigned> newDimOrder,
+                            SmallVector<utils::IteratorType> newIteratorTypes) {
+  sourceNamedConvTy namedConv = cast<sourceNamedConvTy>(srcConv);
+  // Get the zero-point scalar operands (operands 2 and 3 for _Q convs).
+  Value lhsZp = srcConv->getOperand(2);
+  Value rhsZp = srcConv->getOperand(3);
+  return targetNamedConvTy::create(b, loc, output.getType(),
+                                   ValueRange{input, filter, lhsZp, rhsZp},
+                                   output, namedConv.getStrides(),
+                                   namedConv.getDilations())
+      .getResult(0);
+}
+
 // Named op -> named op conversions if a default inner tile size is specified.
+
+struct ConvertLinalgConvNchwFchwQ
+    : OpRewritePattern<linalg::Conv2DNchwFchwQOp> {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(linalg::Conv2DNchwFchwQOp convOp,
+                                PatternRewriter &rewriter) const override {
+    return transposeConvLikeLinalgOp(
+        rewriter, convOp, /*tilingFactor=*/-1,
+        namedQuantizedConvBuilderFn<linalg::Conv2DNchwFchwQOp,
+                                    linalg::Conv2DNhwcHwcfQOp>);
+  }
+};
 
 struct ConvertLinalgConvNchwFchw : OpRewritePattern<linalg::Conv2DNchwFchwOp> {
   using Base::Base;
@@ -471,6 +507,13 @@ struct ConvertLinalgConvOp : OpInterfaceRewritePattern<linalg::LinalgOp> {
 
   LogicalResult matchAndRewrite(linalg::LinalgOp op,
                                 PatternRewriter &rewriter) const override {
+    // Skip quantized convolutions that have scalar (non-shaped) inputs
+    // like zero points. These need the named op → named op path instead.
+    for (Value input : op.getDpsInputs()) {
+      if (!isa<ShapedType>(input.getType())) {
+        return failure();
+      }
+    }
     return transposeConvLikeLinalgOp(rewriter, op, tilingFactor);
   }
 
@@ -663,6 +706,7 @@ public:
       RewritePatternSet patterns(context);
       if (tilingFactor <= 0) {
         patterns.insert<ConvertLinalgConvNchwFchw>(context, /*benefit=*/2);
+        patterns.insert<ConvertLinalgConvNchwFchwQ>(context, /*benefit=*/2);
       }
       patterns.insert<ConvertLinalgConvOp>(context, tilingFactor);
       if (failed(applyPatternsGreedily(op, std::move(patterns)))) {

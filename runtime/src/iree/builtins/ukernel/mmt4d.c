@@ -9,6 +9,20 @@
 #include "iree/builtins/ukernel/exported_bits.h"
 #include "iree/builtins/ukernel/mmt4d_internal.h"
 
+// Optional kernel-level cycle instrumentation for RISC-V targets.
+// Define IREE_UK_BENCHMARK_CYCLES at build time to enable.
+// Prints per-invocation cycle counts and accumulated totals to stdout.
+#if defined(IREE_UK_BENCHMARK_CYCLES) && defined(IREE_UK_ARCH_RISCV_64)
+#include <stdio.h>
+static inline uint64_t iree_uk_rdcycle(void) {
+  uint64_t c;
+  asm volatile("rdcycle %0" : "=r"(c));
+  return c;
+}
+static uint64_t iree_uk_mmt4d_total_kernel_cycles = 0;
+static uint64_t iree_uk_mmt4d_call_count = 0;
+#endif  // IREE_UK_BENCHMARK_CYCLES && IREE_UK_ARCH_RISCV_64
+
 // Architecture-specific early handlers for full loop nest specialization.
 #if defined(IREE_UK_ARCH_RISCV_64)
 extern bool iree_uk_mmt4d_early_riscv_64_xopu(
@@ -128,10 +142,29 @@ static bool iree_uk_mmt4d_early(const iree_uk_mmt4d_params_t* params) {
 void iree_uk_mmt4d_p(const iree_uk_mmt4d_params_t* params) {
   iree_uk_mmt4d_validate(params);
 
+#if defined(IREE_UK_BENCHMARK_CYCLES) && defined(IREE_UK_ARCH_RISCV_64)
+  uint64_t cyc_start = iree_uk_rdcycle();
+#endif
+
   // Maybe handle this mmt4d "early", without needing to select a tile_func.
   // Typical cases include trivial cases (e.g. when params->K == 0) and hardware
   // targets that want to handle the entire loop nest in target-specific code.
-  if (iree_uk_mmt4d_early(params)) return;
+  if (iree_uk_mmt4d_early(params)) {
+#if defined(IREE_UK_BENCHMARK_CYCLES) && defined(IREE_UK_ARCH_RISCV_64)
+    uint64_t cyc_end = iree_uk_rdcycle();
+    uint64_t cyc_delta = cyc_end - cyc_start;
+    iree_uk_mmt4d_total_kernel_cycles += cyc_delta;
+    iree_uk_mmt4d_call_count++;
+    fprintf(stdout, "UKERNEL_CYCLES, M=%d, N=%d, K=%d, M0=%d, N0=%d, K0=%d, "
+            "cycles=%lu, total=%lu, calls=%lu\n",
+            (int)params->M, (int)params->N, (int)params->K,
+            (int)params->M0, (int)params->N0, (int)params->K0,
+            (unsigned long)cyc_delta,
+            (unsigned long)iree_uk_mmt4d_total_kernel_cycles,
+            (unsigned long)iree_uk_mmt4d_call_count);
+#endif
+    return;
+  }
 
   // Select a target-specific tile_func (inner loop on K, computing one M0xN0
   // tile) and use that with generic outer loops.
@@ -151,6 +184,20 @@ void iree_uk_mmt4d_p(const iree_uk_mmt4d_params_t* params) {
   }
 
   iree_uk_mmt4d_using_tile_func(params, tile_func);
+
+#if defined(IREE_UK_BENCHMARK_CYCLES) && defined(IREE_UK_ARCH_RISCV_64)
+  uint64_t cyc_end = iree_uk_rdcycle();
+  uint64_t cyc_delta = cyc_end - cyc_start;
+  iree_uk_mmt4d_total_kernel_cycles += cyc_delta;
+  iree_uk_mmt4d_call_count++;
+  fprintf(stdout, "UKERNEL_CYCLES, M=%d, N=%d, K=%d, M0=%d, N0=%d, K0=%d, "
+          "cycles=%lu, total=%lu, calls=%lu\n",
+          (int)params->M, (int)params->N, (int)params->K,
+          (int)params->M0, (int)params->N0, (int)params->K0,
+          (unsigned long)cyc_delta,
+          (unsigned long)iree_uk_mmt4d_total_kernel_cycles,
+          (unsigned long)iree_uk_mmt4d_call_count);
+#endif
 }
 
 iree_uk_uint32_t iree_uk_mmt4d_info_p(const iree_uk_mmt4d_params_t* params) {

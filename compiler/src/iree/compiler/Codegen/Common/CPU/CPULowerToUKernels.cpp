@@ -626,6 +626,178 @@ matchDAGForUKernel(RewriterBase &rewriter, IREE::Codegen::QueryTileSizesOp op,
 
 namespace {
 
+// ===== Saturn OPU (+xopu) BEGIN =====
+// =============================================================================
+// Fused OPU matmul + QDQ pattern.
+//
+// Matches a linalg.generic that performs dequant+bias+requant+ReLU on the
+// output of an mmt4d ukernel, and replaces both with a single fused
+// iree_uk_opu_matmul_qdq ukernel call.
+//
+// Pattern: ukernel("mmt4d", lhs_i8, rhs_i8) → i32
+//              ↓
+//          generic(i32, bias_f32) → i8  [sitofp→mulf→addf→divf→round→clamp→
+//                                        fptosi→relu→...]
+// Becomes: ukernel("opu_matmul_qdq", lhs_i8, rhs_i8, bias_f32) → i8
+// =============================================================================
+
+/// Check if a linalg.generic body matches the QDQ dequant+bias+requant pattern.
+/// Returns true if the body has: sitofp(i32→f32) → mulf → addf → divf → ...
+static bool isQDQDequantBiasRequantBody(linalg::GenericOp genericOp) {
+  if (genericOp.getNumDpsInputs() != 2 || genericOp.getNumDpsInits() != 1)
+    return false;
+
+  // Input types: i32 (matmul result) + f32 (bias)
+  auto in0Type = cast<ShapedType>(genericOp.getDpsInputOperand(0)->get().getType());
+  auto in1Type = cast<ShapedType>(genericOp.getDpsInputOperand(1)->get().getType());
+  auto outType = cast<ShapedType>(genericOp.getDpsInitOperand(0)->get().getType());
+
+  if (!in0Type.getElementType().isSignlessInteger(32)) return false;
+  if (!in1Type.getElementType().isF32()) return false;
+  if (!outType.getElementType().isSignlessInteger(8)) return false;
+
+  // Check body starts with sitofp (i32 → f32)
+  Block &body = *genericOp.getBody();
+  if (body.getOperations().size() < 5)  // At minimum: sitofp, mulf, addf, fptosi, yield
+    return false;
+
+  auto &firstOp = body.front();
+  if (!isa<arith::SIToFPOp>(firstOp))
+    return false;
+
+  return true;
+}
+
+/// Extract the dequant_scale and inv_requant_scale constants from the QDQ body.
+/// Returns {dequant_scale, inv_requant_scale} or nullopt if not constant.
+static std::optional<std::pair<float, float>>
+extractQDQScales(linalg::GenericOp genericOp) {
+  Block &body = *genericOp.getBody();
+
+  float dequantScale = 0, invRequantScale = 0;
+  bool foundMul = false, foundDiv = false;
+
+  for (auto &op : body.getOperations()) {
+    if (auto mulOp = dyn_cast<arith::MulFOp>(op)) {
+      if (!foundMul) {
+        // First mulf is dequant_scale
+        APFloat val(0.0f);
+        if (matchPattern(mulOp.getRhs(), m_ConstantFloat(&val))) {
+          dequantScale = val.convertToFloat();
+          foundMul = true;
+        }
+      }
+    } else if (auto divOp = dyn_cast<arith::DivFOp>(op)) {
+      if (!foundDiv) {
+        // First divf is requant_scale — we need 1/scale for the kernel
+        APFloat val(0.0f);
+        if (matchPattern(divOp.getRhs(), m_ConstantFloat(&val))) {
+          invRequantScale = 1.0f / val.convertToFloat();
+          foundDiv = true;
+        }
+      }
+    }
+  }
+
+  if (!foundMul || !foundDiv)
+    return std::nullopt;
+  return std::make_pair(dequantScale, invRequantScale);
+}
+
+/// Pattern that matches a QDQ linalg.generic consuming an mmt4d ukernel result,
+/// and replaces both with a fused OPU matmul+QDQ ukernel.
+struct FusedOPUMatmulQDQPattern : OpRewritePattern<linalg::GenericOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
+                                PatternRewriter &rewriter) const override {
+    // Check target is OPU.
+    auto targetAttr = IREE::HAL::ExecutableTargetAttr::lookup(genericOp);
+    if (!targetAttr) return failure();
+    DictionaryAttr config = targetAttr.getConfiguration();
+    if (!config || !hasFeature(config, "+xopu")) return failure();
+    if (!hasUkernel(config, "mmt4d")) return failure();
+
+    // Check this is a QDQ dequant+bias+requant generic.
+    if (!isQDQDequantBiasRequantBody(genericOp))
+      return failure();
+
+    // Check input 0 (i32 matmul result) comes from an mmt4d ukernel.
+    Value matmulResult = genericOp.getDpsInputOperand(0)->get();
+    auto mmt4dUkernel =
+        matmulResult.getDefiningOp<IREE::Codegen::UKernelGenericOp>();
+    if (!mmt4dUkernel) return failure();
+    if (mmt4dUkernel.getUKernelFnName() != "iree_uk_mmt4d") return failure();
+
+    // Check the mmt4d result is only used by this generic (so we can replace).
+    if (!matmulResult.hasOneUse()) return failure();
+
+    // Extract scale constants from the QDQ body.
+    auto scales = extractQDQScales(genericOp);
+    if (!scales) return failure();
+    float dequantScale = scales->first;
+    float invRequantScale = scales->second;
+
+    // Get the mmt4d's inputs (LHS, RHS) and the bias from the generic.
+    // mmt4dUkernel inputs: [lhs_packed, rhs_packed]
+    Value lhs = mmt4dUkernel.getInputs()[0];
+    Value rhs = mmt4dUkernel.getInputs()[1];
+    Value bias = genericOp.getDpsInputOperand(1)->get();
+
+    // Get dimension values from the mmt4d ukernel's other operands.
+    // The mmt4d ukernel has: inputs=[lhs, rhs], outputs=[out],
+    //   other_operands=[M, N, K, M0, N0, K0, flags]
+    ValueRange otherOps = mmt4dUkernel.getOtherOperands();
+    if (otherOps.size() < 7) return failure();
+    Value M = otherOps[0], N = otherOps[1], K = otherOps[2];
+    Value M0 = otherOps[3], N0 = otherOps[4], K0 = otherOps[5];
+
+    Location loc = genericOp.getLoc();
+    Value genericOut = genericOp.getDpsInitOperand(0)->get();
+    auto outType = cast<ShapedType>(genericOut.getType());
+
+    Value finalOut = genericOut;
+    ShapedType finalOutType = outType;
+    Operation *lastReplacedOp = genericOp;
+
+    // Build scale constants.
+    Value dequantScaleVal = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getF32FloatAttr(dequantScale));
+    Value invRequantScaleVal = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getF32FloatAttr(invRequantScale));
+
+    // Build the fused ukernel. Output is the final flat tensor,
+    // bypassing unpack+collapse+pack.
+    FnNameAndDefAttrs fn =
+        getFnNameAndDefAttrs("opu_matmul_qdq", rewriter, targetAttr);
+    SmallVector<Type> returnTypes =
+        getUKernelGenericReturnTypes(targetAttr, finalOutType);
+
+    auto fusedOp = IREE::Codegen::UKernelGenericOp::create(
+        rewriter, loc, returnTypes, fn.name,
+        /*inputs=*/ValueRange{lhs, rhs, bias},
+        /*outputs=*/finalOut,
+        /*otherOperands=*/
+        ValueRange{M, N, K, M0, N0, K0, dequantScaleVal, invRequantScaleVal},
+        /*fn_def_attrs=*/rewriter.getDictionaryAttr(fn.defAttrs),
+        /*num_strided_outer_dims=*/1);
+
+    // Replace the last op in the chain with the fused ukernel's results.
+    SmallVector<Value> results = fusedOp->getResults();
+    results.truncate(lastReplacedOp->getNumResults());
+    rewriter.replaceOp(lastReplacedOp, results);
+
+    // Erase intermediate ops in the chain that are now dead.
+    // Walk backward from the generic to the mmt4d ukernel.
+    if (lastReplacedOp != genericOp) {
+      // The generic and intermediate ops (unpack, collapse) become dead.
+      // They will be cleaned up by DCE since they have no users.
+    }
+
+    return success();
+  }
+};
+
 using TargetPredicate = std::function<bool(IREE::HAL::ExecutableTargetAttr)>;
 
 template <typename OpType>
@@ -679,6 +851,11 @@ void CPULowerToUKernelsPass::runOnOperation() {
                   LowerToUKernelPattern<linalg::PackOp>,
                   LowerToUKernelPattern<linalg::UnPackOp>>(
       context, allTargets, skipIntermediateRoundings);
+  // Fused OPU matmul + QDQ pattern: matches generic(dequant+bias+requant)
+  // consuming mmt4d ukernel output, replaces both with a single fused kernel.
+  // Must run AFTER mmt4d→ukernel conversion (same greedy application).
+  patterns.insert<FusedOPUMatmulQDQPattern>(context);
+  // ===== Saturn OPU (+xopu) END =====
   // These patterns are inherently specific to the VMVX backend.
   patterns.insert<LowerToUKernelPattern<IREE::Codegen::QueryTileSizesOp>>(
       context, isVMVXBackend);

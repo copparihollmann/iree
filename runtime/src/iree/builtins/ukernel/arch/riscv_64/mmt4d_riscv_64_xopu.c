@@ -1298,4 +1298,147 @@ IREE_UK_MMT4D_TILE_FUNC_IMPL_FOR_M0(
     iree_uk_mmt4d_tile_f8e4m3f8e4m3f32_1xXXx16_to_16xXXx16_riscv_64_xopu,
     iree_uk_mmt4d_tile_f8e4m3f8e4m3f32_16xXXx16_riscv_64_xopu, 16)
 
+// =============================================================================
+// Fused OPU matmul + QDQ kernel (XNNPACK-style).
+//
+// Computes: out_i8 = requant(dequant(matmul_i32) * scale + bias)
+//
+// This fuses the entire QDQ chain into the OPU matmul kernel:
+//   1. VOPACC: i8 × i8 → i32 in matrix registers
+//   2. VMV_VR: extract i32 row to vector register
+//   3. vfcvt.f.x.v: i32 → f32
+//   4. vfmadd.vf: f32 * dequant_scale + bias (fused multiply-add)
+//   5. vfmul.vf: f32 * inv_requant_scale (= 1/output_scale)
+//   6. vfcvt.x.f.v: f32 → i32 with RNE rounding (hardware roundeven)
+//   7. vmax/vmin: clamp to [-128, 127]
+//   8. vnsrl: i32 → i16 → i8 (narrow)
+//   9. vse8: store i8 output
+//
+// ~12 instructions per output row vs ~165 for the split mmt4d + generic path.
+// Modeled on saturn/benchmarks and XNNPACK qs8_qc8w_gemm_minmax_fp32.
+// =============================================================================
+
+// Store one 16-element row from matrix register mx as requantized i8.
+// Performs: dequant(i32) → scale+bias → requant → clamp → i8.
+// Uses hardware RNE rounding via fsrmi/vfcvt instead of software roundeven.
+#define OPU_STORE_SUBTILE_QDQ_I8(mx, out_ptr, out_stride, nrows, ncols,       \
+                                 dequant_scale, bias_ptr,                      \
+                                 inv_requant_scale)                            \
+  do {                                                                         \
+    /* Load bias vector once (same for all rows — per-channel bias) */         \
+    asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(ncols));        \
+    asm volatile("vle32.v v4, (%0)" : : "r"(bias_ptr) : "memory");           \
+    for (int _r = 0; _r < (nrows); ++_r) {                                    \
+      /* Extract row from matrix register to v0 (i32 x ncols) */              \
+      asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(ncols));      \
+      asm volatile(".insn r 0x57, 0x6, 0x5d, x0, %0, " #mx                   \
+                   :                                                           \
+                   : "r"(_r)                                                   \
+                   : "memory");                                                \
+      /* v0 = i32 accumulator row */                                           \
+      /* Dequant: i32 → f32, then v0 = v0 * dequant_scale + bias */           \
+      asm volatile("vfcvt.f.x.v v0, v0" ::: "memory");                       \
+      asm volatile("vfmadd.vf v0, %0, v4"                                     \
+                   :                                                           \
+                   : "f"((float)(dequant_scale))                               \
+                   : "memory");                                                \
+      /* Requant: multiply by 1/output_scale */                                \
+      asm volatile("vfmul.vf v0, v0, %0"                                      \
+                   :                                                           \
+                   : "f"((float)(inv_requant_scale))                           \
+                   : "memory");                                                \
+      /* Round to nearest even using hardware RNE mode */                      \
+      asm volatile("fsrmi 0" ::: "memory"); /* RNE rounding mode */           \
+      asm volatile("vfcvt.x.f.v v0, v0" ::: "memory"); /* f32→i32 RNE */     \
+      asm volatile("fsrmi 4" ::: "memory"); /* Restore default */             \
+      /* Clamp to [-128, 127] */                                               \
+      asm volatile("vmax.vx v0, v0, %0" : : "r"(-128) : "memory");           \
+      asm volatile("vmin.vx v0, v0, %0" : : "r"(127) : "memory");            \
+      /* Narrow i32 → i16 → i8 */                                             \
+      asm volatile("vsetvli zero, %0, e16, m2, ta, ma" : : "r"(ncols));      \
+      asm volatile("vnsrl.wi v8, v0, 0" ::: "memory"); /* i32→i16 */         \
+      asm volatile("vsetvli zero, %0, e8, m1, ta, ma" : : "r"(ncols));       \
+      asm volatile("vnsrl.wi v8, v8, 0" ::: "memory"); /* i16→i8 */          \
+      /* ReLU: max(0, x) */                                                    \
+      asm volatile("vmax.vx v8, v8, zero" ::: "memory");                      \
+      /* Store i8 output */                                                    \
+      asm volatile("vse8.v v8, (%0)"                                           \
+                   :                                                           \
+                   : "r"((iree_uk_int8_t*)(out_ptr) + _r * (out_stride))      \
+                   : "memory");                                                \
+    }                                                                          \
+  } while (0)
+
+// Fused OPU matmul + QDQ: i8 × i8 → i8 (with dequant, bias, requant, ReLU).
+// Parameters:
+//   lhs_packed: [M, K, M0, K0] packed int8 LHS
+//   rhs_packed: [N, K, N0, K0] packed int8 RHS
+//   out_i8:     [M*M0, N*N0] flat int8 output (row-major)
+//   M, N, K, M0, N0, K0: tile dimensions
+//   dequant_scale: scalar f32 (product of input_scale * weight_scale)
+//   bias:       [N*N0] f32 per-channel bias (pre-scaled)
+//   inv_requant_scale: scalar f32 (1.0 / output_scale)
+IREE_UK_EXPORT void iree_uk_opu_matmul_qdq(
+    const void* lhs_packed, const void* rhs_packed, void* out_i8,
+    int32_t M, int32_t N, int32_t K, int32_t M0, int32_t N0, int32_t K0,
+    float dequant_scale, const float* bias, float inv_requant_scale) {
+  const int HW = 16;  // OPU hardware width
+  const iree_uk_int8_t* lhs = (const iree_uk_int8_t*)lhs_packed;
+  const iree_uk_int8_t* rhs = (const iree_uk_int8_t*)rhs_packed;
+  iree_uk_int8_t* out = (iree_uk_int8_t*)out_i8;
+
+  const int lhs_panel_stride = K * M0 * K0;
+  const int rhs_panel_stride = K * N0 * K0;
+  const int out_stride = N * N0;  // row stride for 2D output
+
+  for (int i = 0; i < M; ++i) {
+    const iree_uk_int8_t* lhs_panel = lhs + i * lhs_panel_stride;
+
+    for (int j = 0; j < N; ++j) {
+      const iree_uk_int8_t* rhs_panel = rhs + j * rhs_panel_stride;
+      iree_uk_int8_t* out_tile = out + i * M0 * out_stride + j * N0;
+
+      // Process sub-tiles using 16x16 OPU hardware
+      for (int m_sub = 0; m_sub < M0; m_sub += HW) {
+        int m_hw = (M0 - m_sub < HW) ? (M0 - m_sub) : HW;
+
+        for (int n_sub = 0; n_sub < N0; n_sub += HW) {
+          int n_hw = (N0 - n_sub < HW) ? (N0 - n_sub) : HW;
+
+          // Init accumulator matrix register m0
+          asm volatile("vsetvli zero, %0, e32, m4, ta, ma" : : "r"(n_hw));
+          asm volatile("vmv.v.i v0, 0" ::: "memory");
+          iree_uk_riscv_64_xopu_opmvinbcast_m0_from_v0();
+
+          // K loop: accumulate outer products
+          asm volatile("vsetvli zero, %0, e8, m1, ta, ma" : : "r"(HW));
+          for (int k = 0; k < K; ++k) {
+            const iree_uk_int8_t* lhs_k = lhs_panel + k * M0 * K0 + m_sub;
+            const iree_uk_int8_t* rhs_k = rhs_panel + k * N0 * K0 + n_sub;
+
+            for (int k0 = 0; k0 < K0; ++k0) {
+              asm volatile(
+                  "vle8.v v16, (%0)\n\t"
+                  "vle8.v v18, (%1)\n\t"
+                  :
+                  : "r"(lhs_k + k0 * M0), "r"(rhs_k + k0 * N0)
+                  : "memory");
+              iree_uk_riscv_64_xopu_vopacc_m0_v16_v18();
+            }
+          }
+
+          // Fused QDQ store: dequant + bias + requant + ReLU → i8
+          const float* bias_tile = bias + j * N0 + n_sub;
+          iree_uk_int8_t* out_sub =
+              out_tile + m_sub * out_stride + n_sub;
+
+          OPU_STORE_SUBTILE_QDQ_I8(x0, out_sub, out_stride, m_hw, n_hw,
+                                    dequant_scale, bias_tile,
+                                    inv_requant_scale);
+        }
+      }
+    }
+  }
+}
+
 #endif // IREE_UK_ARCH_RISCV_64
