@@ -720,8 +720,8 @@ static iree_status_t iree_hal_deferred_command_buffer_dispatch(
       sizeof(iree_hal_cmd_dispatch_t), &total_size,
       IREE_STRUCT_FIELD_ALIGNED(constants.data_length, uint8_t,
                                 iree_max_align_t, &constants_offset),
-      IREE_STRUCT_FIELD_ALIGNED(bindings.count, iree_hal_buffer_ref_t, 1,
-                                &bindings_offset)));
+      IREE_STRUCT_FIELD_ALIGNED(bindings.count, iree_hal_buffer_ref_t,
+                                iree_max_align_t, &bindings_offset)));
 
   iree_hal_cmd_dispatch_t* cmd = NULL;
   IREE_RETURN_IF_ERROR(iree_hal_cmd_list_append_command(
