@@ -6,8 +6,64 @@
 
 #include "iree/hal/utils/deferred_command_buffer.h"
 
+#include <stdio.h>
+
 #include "iree/base/internal/arena.h"
 #include "iree/hal/utils/resource_set.h"
+
+// Gate for the [apply]/[d]/[vm_invoke] debug prints so we don't spam the UART
+// during the ~1000 setup dispatches that run before Warmup START. The
+// benchmark calls `iree_merlin_enable_dispatch_debug(1)` right before its
+// warmup loop begins. Default 0 → all debug prints are skipped.
+int iree_merlin_dispatch_debug_enabled = 0;
+
+void iree_merlin_enable_dispatch_debug(int enable) {
+    iree_merlin_dispatch_debug_enabled = enable ? 1 : 0;
+}
+
+// Separate gate for verbose per-dispatch binding/alignment prints
+// ([binding] in embedded_elf_loader, [align] in model_benchmark). These
+// are high-volume and pollute uartlog for multi-model sweeps; kept off
+// unless a debug session explicitly opts in.
+int iree_merlin_binding_debug_enabled = 0;
+
+void iree_merlin_enable_binding_debug(int enable) {
+    iree_merlin_binding_debug_enabled = enable ? 1 : 0;
+}
+
+// Per-ordinal cycle accumulator. Populated in-place by
+// iree_hal_elf_executable_issue_call (embedded_elf_loader.c) wrapping
+// every ELF call with rdcycle. The benchmark harness calls
+// iree_merlin_dump_cycles() after the final bench iteration to emit one
+// "CYC, <ordinal>, <symbol>, <total_cycles>" line per dispatch — cheap
+// O(num_dispatches) UART traffic (tens to hundreds of lines), vs the
+// O(num_workgroups × num_iters) cost of the [dc] per-workgroup prints.
+//
+// Size 1024 covers every production model we run (tinyllama has 698).
+#define IREE_MERLIN_MAX_ORDINALS 1024
+uint64_t iree_merlin_cycles_per_ordinal[IREE_MERLIN_MAX_ORDINALS] = {0};
+uint64_t iree_merlin_wg_count_per_ordinal[IREE_MERLIN_MAX_ORDINALS] = {0};
+// Symbol name lookup, captured from library->exports.names when seen.
+// Kept as const char* (pointers into the .rodata string table of the
+// embedded ELF; valid for the lifetime of the HAL executable which
+// outlives dispatch).
+const char *iree_merlin_sym_per_ordinal[IREE_MERLIN_MAX_ORDINALS] = {NULL};
+uint32_t iree_merlin_max_ordinal_seen = 0;
+
+void iree_merlin_dump_cycles(void) {
+    fprintf(stdout, "CYC, begin\n");
+    for (uint32_t o = 0; o <= iree_merlin_max_ordinal_seen &&
+                        o < IREE_MERLIN_MAX_ORDINALS; ++o) {
+        if (iree_merlin_wg_count_per_ordinal[o] == 0) continue;
+        const char *sym = iree_merlin_sym_per_ordinal[o];
+        if (!sym) sym = "(unknown)";
+        fprintf(stdout, "CYC, %u, %s, %llu, %llu\n", (unsigned)o, sym,
+                (unsigned long long)iree_merlin_cycles_per_ordinal[o],
+                (unsigned long long)iree_merlin_wg_count_per_ordinal[o]);
+    }
+    fprintf(stdout, "CYC, end\n");
+    fflush(stdout);
+}
 
 //===----------------------------------------------------------------------===//
 // Command recording structures
@@ -753,6 +809,17 @@ static iree_status_t iree_hal_deferred_command_buffer_apply_dispatch(
     iree_hal_command_buffer_t* target_command_buffer,
     iree_hal_buffer_binding_table_t binding_table,
     const iree_hal_cmd_dispatch_t* cmd) {
+  // Debug: print before each dispatch apply (higher level than issue_call).
+  // Gated on iree_merlin_dispatch_debug_enabled so setup dispatches before
+  // Warmup START don't spam the UART (each UART round-trip is expensive on
+  // FireSim).
+  if (iree_merlin_dispatch_debug_enabled) {
+    static int _ad_count = 0;
+    ++_ad_count;
+    fprintf(stderr, "[apply] #%d ord=%d bindings=%zu\n", _ad_count,
+            (int)cmd->export_ordinal, cmd->bindings.count);
+    fflush(stderr);
+  }
   iree_hal_dispatch_config_t config = cmd->config;
   IREE_RETURN_IF_ERROR(iree_hal_buffer_binding_table_resolve_ref(
       binding_table, cmd->config.workgroup_count_ref,
