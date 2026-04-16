@@ -73,6 +73,149 @@ namespace mlir::iree_compiler {
 
 namespace {
 
+// Saturn OPU (`+xopu`) RISC-V hardware has a vector unit that hangs on
+// `vfredusum.vs` (and likely sister float-reduction opcodes). Until the
+// underlying RTL is fixed, structurally prevent codegen from emitting any
+// `vector.reduction` over a floating-point element type when the target
+// includes the `+xopu` feature: rewrite the reduction into a chain of scalar
+// `vector.extract` + scalar arith op. Gated by a runtime check inside
+// `ConvertToLLVMPass::runOnOperation()` so non-Saturn RISC-V (and non-RISC-V)
+// targets are byte-identical before/after.
+//
+// Returns `result = acc [op] src[0] [op] src[1] ... [op] src[n-1]`, or without
+// `acc` the first lane seeds the accumulator. If `mask` is non-null (the
+// reduction was inside a `vector.mask`), each per-lane contribution is gated
+// by the matching mask bit via `arith.select`.
+static Value scalarizeFloatReduction(PatternRewriter &rewriter, Location loc,
+                                     vector::ReductionOp op, Value src,
+                                     Value acc, Value mask) {
+  auto vecTy = llvm::cast<VectorType>(src.getType());
+  int64_t n = vecTy.getNumElements();
+  arith::FastMathFlagsAttr fmf = op.getFastMathFlagsAttr();
+  auto kind = op.getKind();
+  Value result = acc;
+  int64_t startIdx = 0;
+  if (!result) {
+    result =
+        rewriter.create<vector::ExtractOp>(loc, src, ArrayRef<int64_t>{0});
+    startIdx = 1;
+  }
+  auto combine = [&](Value a, Value b) -> Value {
+    switch (kind) {
+    case vector::CombiningKind::ADD:
+      return rewriter.create<arith::AddFOp>(loc, a, b, fmf);
+    case vector::CombiningKind::MUL:
+      return rewriter.create<arith::MulFOp>(loc, a, b, fmf);
+    case vector::CombiningKind::MINIMUMF:
+      return rewriter.create<arith::MinimumFOp>(loc, a, b, fmf);
+    case vector::CombiningKind::MAXIMUMF:
+      return rewriter.create<arith::MaximumFOp>(loc, a, b, fmf);
+    case vector::CombiningKind::MINNUMF:
+      return rewriter.create<arith::MinNumFOp>(loc, a, b, fmf);
+    case vector::CombiningKind::MAXNUMF:
+      return rewriter.create<arith::MaxNumFOp>(loc, a, b, fmf);
+    default:
+      return nullptr;
+    }
+  };
+  for (int64_t i = startIdx; i < n; ++i) {
+    Value lane =
+        rewriter.create<vector::ExtractOp>(loc, src, ArrayRef<int64_t>{i});
+    Value combined = combine(result, lane);
+    if (!combined) {
+      return nullptr;
+    }
+    if (mask) {
+      Value mBit =
+          rewriter.create<vector::ExtractOp>(loc, mask, ArrayRef<int64_t>{i});
+      result = rewriter.create<arith::SelectOp>(loc, mBit, combined, result);
+    } else {
+      result = combined;
+    }
+  }
+  return result;
+}
+
+static bool isFloatReductionWePatch(vector::ReductionOp op) {
+  auto vecTy = op.getSourceVectorType();
+  if (vecTy.isScalable() || vecTy.getNumElements() <= 0) {
+    return false;
+  }
+  if (!isa<FloatType>(vecTy.getElementType())) {
+    return false;
+  }
+  auto kind = op.getKind();
+  return kind == vector::CombiningKind::ADD ||
+         kind == vector::CombiningKind::MUL ||
+         kind == vector::CombiningKind::MINIMUMF ||
+         kind == vector::CombiningKind::MAXIMUMF ||
+         kind == vector::CombiningKind::MINNUMF ||
+         kind == vector::CombiningKind::MAXNUMF;
+}
+
+struct ScalarizeXopuFloatReductionPattern
+    : public OpRewritePattern<vector::ReductionOp> {
+  using OpRewritePattern<vector::ReductionOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::ReductionOp op,
+                                PatternRewriter &rewriter) const override {
+    // Masked reductions are handled by the sibling pattern below — a
+    // `vector.mask` region is required to contain exactly one maskable op,
+    // and replacing that op with a multi-op scalar chain would violate
+    // that invariant.
+    if (op->getParentOfType<vector::MaskOp>()) {
+      return failure();
+    }
+    if (!isFloatReductionWePatch(op)) {
+      return failure();
+    }
+    Value result = scalarizeFloatReduction(rewriter, op.getLoc(), op,
+                                           op.getVector(), op.getAcc(),
+                                           /*mask=*/nullptr);
+    if (!result) {
+      return failure();
+    }
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+// Masked variant: match the entire `vector.mask { vector.reduction ... }`
+// wrapper and rewrite to a scalar chain where each per-lane contribution
+// is gated by the matching mask lane via `arith.select`.
+struct ScalarizeXopuMaskedFloatReductionPattern
+    : public OpRewritePattern<vector::MaskOp> {
+  using OpRewritePattern<vector::MaskOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::MaskOp maskOp,
+                                PatternRewriter &rewriter) const override {
+    Block &body = maskOp.getMaskRegion().front();
+    // Expect exactly [reduction, yield].
+    if (std::distance(body.begin(), body.end()) != 2) {
+      return failure();
+    }
+    auto redOp = dyn_cast<vector::ReductionOp>(&body.front());
+    if (!redOp) {
+      return failure();
+    }
+    if (!isFloatReductionWePatch(redOp)) {
+      return failure();
+    }
+    // Passthru is currently unsupported; fall back to default lowering if
+    // the mask op has one (rare, and masked float reductions typically
+    // don't specify it).
+    if (maskOp.getPassthru()) {
+      return failure();
+    }
+    Value result = scalarizeFloatReduction(
+        rewriter, maskOp.getLoc(), redOp, redOp.getVector(), redOp.getAcc(),
+        maskOp.getMask());
+    if (!result) {
+      return failure();
+    }
+    rewriter.replaceOp(maskOp, result);
+    return success();
+  }
+};
+
 template <typename OpT>
 struct ConvertOpToLLVMWithABIPattern : ConvertOpToLLVMPattern<OpT> {
   ConvertOpToLLVMWithABIPattern(HALDispatchABI &abi,
@@ -990,6 +1133,36 @@ void ConvertToLLVMPass::runOnOperation() {
     targetConfig = targetAttr.getConfiguration();
   }
 
+  // Saturn workaround: structurally prevent emission of `vfredusum.vs`
+  // (and sister float-reduction opcodes that share the same hung Saturn
+  // execution path) by scalarizing every `vector.reduction` over a
+  // floating-point element type before any other vector-level lowering
+  // can pick them up. Originally gated strictly on `+xopu`, but the same
+  // hardware bug bites pure-RVV (`+v` only) builds targeting Saturn —
+  // those compiles never set `+xopu` so the gate was a no-op and the
+  // RVV cross-compile of vit_small still hung at LayerNorm. We extend
+  // the gate to also fire on Saturn FireSim builds, which use the
+  // bare-metal triple `riscv64-unknown-elf`. Other RISC-V targets
+  // (notably SpacemiT X60, triple `riscv64-unknown-linux-gnu`) are
+  // unaffected — their RVV path stays unscalarized.
+  // TEMPORARY (pre-deadline 2026-04-15): scalarize for any RISC-V
+  // target with a vector extension. This is broader than ideal — it
+  // also affects SpacemiT X60 builds, which don't have the Saturn
+  // hardware bug. Refine to a Saturn-only gate (e.g. `+xopu` plus
+  // bare-metal-RISC-V triple `OS == UnknownOS`) after the deadline.
+  bool isAnyRVV =
+      targetConfig && isRISCV(targetConfig) && hasAnyVFeature(targetConfig);
+  if (targetConfig &&
+      (hasFeature(targetConfig, "+xopu") || isAnyRVV)) {
+    RewritePatternSet xopuPatterns(&getContext());
+    xopuPatterns.add<ScalarizeXopuMaskedFloatReductionPattern,
+                     ScalarizeXopuFloatReductionPattern>(&getContext());
+    if (failed(applyPatternsGreedily(getOperation(),
+                                     std::move(xopuPatterns)))) {
+      return signalPassFailure();
+    }
+  }
+
   // Run Vector -> Vector transformations ahead of conversion to LLVM.
   {
     RewritePatternSet patterns(&getContext());
@@ -1154,6 +1327,73 @@ void ConvertToLLVMPass::runOnOperation() {
     if (failed(applyPatternsGreedily(moduleOp, std::move(postPatterns)))) {
       return signalPassFailure();
     }
+  }
+
+  // Per-function target-features override for Saturn f32 reductions.
+  //
+  // Motivation: Saturn FireSim has a broken RVV lowering for f32 reductions
+  // (LayerNorm mean/variance, softmax max/sum). LLVM's loop vectorizer emits
+  // a `vsetivli mf2 VL=1` + `vfmacc.vf` + `vslidedown.vi` tree-reduction
+  // sequence that stalls the vector unit indefinitely. The `mt_bmm_4x64x64_opu_novec`
+  // microtest proved that dropping `+v` fixes the hang, and the working
+  // non-reduction dispatches show that we must NOT drop `+v` globally — the
+  // i8 matmul path + OPU ukernels require it.
+  //
+  // Solution: attach `target_features = "-v"` to the handful of LLVM
+  // functions (LN + softmax dispatches in vit/tinyllama, matching symbols
+  // `*_reduction_*_f32*` and `*_softmax_*xf32*`) so LLVM emits scalar
+  // fadd.s/fmul.s/fsqrt.s for those functions only. Every other function
+  // in the module keeps +v,+xopu and continues to emit full RVV + OPU
+  // custom ISA. Per-function target features are a standard LLVM feature
+  // and merge correctly in the emitted object file.
+  //
+  // Gate: only activate when the target has `+v` (otherwise the attribute
+  // is a no-op). Skip when `+xopu` is absent AND RVV vector not present
+  // (the gate mirrors the ScalarizeXopu*Reduction gate above).
+  if (targetConfig &&
+      (hasFeature(targetConfig, "+xopu") || isAnyRVV)) {
+    // Build the full feature list from the variant config with +v flipped
+    // to -v. We can't just append "-v" as a single-element list — LLVM
+    // treats target-features as an AUTHORITATIVE per-function override,
+    // so anything we don't list (like +f,+d,+m) is dropped. That would
+    // leave scalar floats emulated via __addsf3/__mulsf3 soft-float
+    // libcalls which bare-metal newlib doesn't link.
+    std::optional<StringRef> cpuFeaturesStr =
+        getConfigCpuFeatures(targetConfig);
+    SmallVector<std::string> devectorizedFeats;
+    if (cpuFeaturesStr) {
+      SmallVector<StringRef> splits;
+      cpuFeaturesStr->split(splits, ',', /*MaxSplit=*/-1,
+                            /*KeepEmpty=*/false);
+      for (StringRef feat : splits) {
+        devectorizedFeats.emplace_back(feat == "+v" ? "-v" : feat.str());
+      }
+    } else {
+      devectorizedFeats.emplace_back("-v");
+    }
+    SmallVector<StringRef> devectorizedFeatsRefs;
+    for (const auto &s : devectorizedFeats)
+      devectorizedFeatsRefs.push_back(s);
+    LLVM::TargetFeaturesAttr devectorized =
+        LLVM::TargetFeaturesAttr::get(&getContext(), devectorizedFeatsRefs);
+
+    moduleOp.walk([&](LLVM::LLVMFuncOp funcOp) {
+      StringRef name = funcOp.getSymName();
+      // Symbol-name patterns observed to hit the Saturn vfmacc.vf +
+      // vslidedown.vi tree-reduction hang. Match `contains("f32")`
+      // (not `ends_with`) because IREE emits multi-typed suffixes like
+      // `reduction_128x64_i8xf32xf32xi8xf32` where the reduction
+      // accumulator is f32 but the symbol ends in a different type.
+      // (matmul_like_*_i8xi8xi32 is intentionally NOT in this list:
+      // those functions use scalable vector types via the mmt4d
+      // ukernel and stripping +v makes LLVM crash on them.)
+      bool isHangProne =
+          (name.contains("reduction") && name.contains("f32")) ||
+          (name.contains("softmax") && name.contains("f32")) ||
+          (name.contains("elementwise_transpose") && name.contains("f32"));
+      if (!isHangProne) return;
+      funcOp.setTargetFeaturesAttr(devectorized);
+    });
   }
 }
 

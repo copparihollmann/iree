@@ -1,0 +1,266 @@
+
+/// Utility to compute the tile sizes for RISC-V Vector.
+/// Supports both non-widening float matmul and widening int matmul (i8 -> i32).
+static void
+getMatmulRISCVVectorSizes(mlir::FunctionOpInterface entryPointFn,
+                          linalg::LinalgOp op, int64_t vectorSize,
+                          SmallVectorImpl<int64_t> &sizes,
+                          SmallVectorImpl<bool> &scalableSizeFlags) {
+  if (!sizes.empty()) {
+    return;
+  }
+  // Preserve dedicated SpacemiT dot-product path.
+  if (getMatmulSpacemiTVectorSizes(entryPointFn, op, sizes)) {
+    return;
+  }
+
+  Type lhsType = getElementTypeOrSelf(op.getDpsInputOperand(0)->get().getType());
+  Type rhsType = getElementTypeOrSelf(op.getDpsInputOperand(1)->get().getType());
+  Type outType = getElementTypeOrSelf(op.getDpsInitOperand(0)->get().getType());
+  
+  bool isWideningI8ToI32 =
+      lhsType.isSignlessInteger(8) && rhsType.isSignlessInteger(8) &&
+      outType.isSignlessInteger(32);
+
+  FailureOr<linalg::ContractionDimensions> cDims =
+      linalg::inferContractionDims(op);
+  if (failed(cDims) || cDims->m.size() != 1) {
+    return;
+  }
+
+  int64_t nativeVectorSize = getNativeVectorSizeInBytes(entryPointFn);
+
+  if (isWideningI8ToI32) {
+    // Widening integer path (i8, i8 -> i32):
+    constexpr int64_t kByteSizeInBits = 8;
+    constexpr int64_t kAccumulatorBitWidth = 32;
+    
+    // CRITICAL FIX: Multiply by 4 to target LMUL=4 throughput
+    constexpr int64_t targetLMUL = 4; 
+
+    // Calculate N to fill LMUL4 registers.
+    // (32 bytes * 8 bits * 4 LMUL) / 32 bits = 32 elements.
+    int64_t nSize =
+        (nativeVectorSize * kByteSizeInBits * targetLMUL) / kAccumulatorBitWidth;
+    
+    // M=4 (Safe), N=32 (Fast), K=1 (Scalar Loop)
+    sizes.append({6, nSize, 1});
+
+    ArrayRef<int64_t> lhsShape = op.getShape(op.getDpsInputOperand(0));
+    // Matrix-vector optimization (M=1)
+    if (lhsShape[cDims->m[0]] == 1) {
+      sizes[0] = 1;
+      sizes[1] *= 2; // Use LMUL8 or loop unrolling for single row
+    }
+    return;
+  }
+
+  // --- Keep Existing Float Behavior ---
+  FailureOr<Type> elementType = nonWideningLinalgElementType(op);
+  if (failed(elementType)) {
+    return;
+  }
+  int64_t elementSize;
+  if (elementType->isF16()) {
+    elementSize = 16;
+  } else if (elementType->isF32()) {
+    elementSize = 32;
+  } else if (elementType->isF64()) {
+    elementSize = 64;
+  } else {
+    return;
+  }
+
+  // Use 6 x lmul4 to prevent spills (Original was 7, 6 is safer on X60)
+  sizes.push_back(6);
+  // Calculate tile size for the main vector dimension (N).
+  constexpr int64_t kByteSizeInBits = 8;
+  int64_t maxNumberElementsForLMUL4 =
+      (nativeVectorSize * 2 * kByteSizeInBits) / elementSize;
+  sizes.push_back(maxNumberElementsForLMUL4);
+  sizes.push_back(1);
+
+  ArrayRef<int64_t> lhsShape = op.getShape(op.getDpsInputOperand(0));
+  // If m = 1, set tile size to 1 x lmul8
+  if (lhsShape[cDims->m[0]] == 1) {
+    sizes[0] = 1;
+    sizes[1] *= 2;
+  }
+}
+
+And this:
+
+   return {
+        // M=4: Register safe (16 accumulators).
+        // N=32: Vector throughput (LMUL=4).
+        // K=8: Memory alignment (32 bytes fetch).
+        TileMxNxK{6, N0, 1}, 
+        TileMxNxK{4, N0, 1}, 
+        TileMxNxK{2, N0, 1},
+        TileMxNxK{1, N0, 1},
+    };
+  }
+
+Math relationship:
+
+Here is the comprehensive summary of the mathematical relationships governing RISC-V Vector (RVV) compilation for the SpacemiT X60, and how these values propagate through the three critical compiler files.
+
+---
+
+# RVV Compilation Physics: The Relationships
+
+The entire compilation chain is driven by a single hardware constant (**VLEN**) and one software choice (**Tile Size N**).
+
+### 1. Hardware Constant: VLEN
+
+The SpacemiT X60 has a fixed hardware vector length.
+
+* **VLEN = 256 bits**
+
+### 2. Software Choice: Tile Size N
+
+This is the number of elements processed in a single vector instruction.
+
+* **Accumulator Type:** `i32` (32 bits).
+* **Vector Width (Bits):** $N \times 32$.
+
+### 3. Derived Value: LMUL (Register Grouping)
+
+LMUL determines how many physical registers are grouped to hold one vector `N`.
+
+
+$$\text{LMUL} = \frac{\text{Total Vector Bits}}{\text{VLEN}} = \frac{N \times 32}{256}$$
+
+* If **N=32**: $\frac{32 \times 32}{256} = \frac{1024}{256} = \mathbf{4}$ (LMUL=4)
+* If **N=16**: $\frac{16 \times 32}{256} = \frac{512}{256} = \mathbf{2}$ (LMUL=2)
+
+### 4. Derived Value: LLVM `vscale` and `count`
+
+LLVM IR represents vectors as "scalable" types: `vector<[count] x type>`. The actual size at runtime is `vscale * count`.
+
+* **vscale Constant:** Defined by LLVM as $\frac{\text{VLEN}}{64}$.
+* For X60: $256 / 64 = \mathbf{4}$.
+
+
+* **count Variable:** We must solve for this to match our desired $N$.
+
+$$N = \text{vscale} \times \text{count}$$
+
+
+$$\text{count} = \frac{N}{4}$$
+
+
+* If **N=32**: count = $32/4 = \mathbf{8}$. LLVM Type: `vector<[8]xi32>`
+* If **N=16**: count = $16/4 = \mathbf{4}$. LLVM Type: `vector<[4]xi32>`
+
+---
+
+# Implementation Guide: The 3 Files
+
+To change the configuration (e.g., changing N from 32 to 16, or changing M), you must update these three files consistently.
+
+## 1. Data Packing (`CPUEncodingExternalModels.cpp`)
+
+**Role:** Defines how memory blocks are physically arranged (packed) in RAM before computation.
+**Constraint:** Must match **Tile Size N** exactly. If this mismatches, the kernel reads garbage data.
+
+**Location:** `enumerateMatmulTileRiscv64`
+**Update Math:**
+
+
+$$N_0 = \frac{\text{VLEN}}{32} \times \text{LMUL}$$
+
+```cpp
+// Example for N=16 (LMUL=2)
+int elementsPerReg = vlen / 32; // 256/32 = 8
+int N0 = elementsPerReg * 2;    // 8 * 2 = 16 elements
+
+return {
+    TileMxNxK{8, N0, 1}, // M=8, N=16, K=1
+    // ...
+};
+
+```
+
+## 2. Compute Tiling (`KernelDispatch.cpp`)
+
+**Role:** Tells the compiler how to split loops.
+**Constraint:** Must match **Tile Size N** (via `targetLMUL`) and defines **Unroll Factor M**.
+
+**Location:** `getMatmulRISCVVectorSizes`
+**Update Math:**
+
+1. Set `targetLMUL` to achieve desired $N$.
+2. Set `sizes` to `{M, N, K}`.
+
+```cpp
+// Example for N=16 (LMUL=2), M=8
+constexpr int64_t targetLMUL = 2; // Implies N = (256*2)/32 = 16
+
+// Calculate N based on LMUL
+int64_t nSize = (nativeVectorSize * 8 * targetLMUL) / 32;
+
+// Set Tile Sizes {M, N, K}
+// M=8: Force unrolling 8 rows.
+sizes.append({8, nSize, 1}); 
+
+```
+
+## 3. Kernel Generation (`VectorContractCustomKernels.cpp`)
+
+**Role:** Generates the actual machine code (ASM/Intrinsics).
+**Constraint:** Must match **Tile Size N** (vector width), **Unroll Factor M** (instruction count), and **LLVM Types** (count).
+
+**Update Math:**
+
+1. **Register Config:** `rhsRegSize` and `accRegSize` must equal $N$. `lhsRegs` must equal $M$.
+2. **LLVM Types:** `VectorType::get({count}, ...)` where $\text{count} = N / 4$.
+3. **ASM/Loop:** Must repeat arithmetic instructions $M$ times.
+
+**Location A: Kernel Definition**
+
+```cpp
+// Kernel Definition for M=8, N=16
+MMTKernel MMTKernel_RVV_8x16x1() {
+  kernel.m0 = 8;  // Matches KernelDispatch M
+  kernel.n0 = 16; // Matches KernelDispatch N
+  
+  kernel.lhsRegs = 8; // M=8 scalars
+  kernel.rhsRegSize = 16; // N=16 elements
+  kernel.accRegSize = 16; // N=16 elements
+  // ...
+}
+
+```
+
+**Location B: Generator Function (`generateRVVStandardIntrinsics`)**
+
+```cpp
+// Generator Logic
+// 1. Calculate count for LLVM Types: count = N / 4 = 16 / 4 = 4
+VectorType type_nxv4i32 = VectorType::get({4}, ...); 
+
+// 2. Set Vector Length Constant: VL = N = 16
+Value vl = rewriter.create<LLVM::ConstantOp>(..., 16);
+
+// 3. Loops must run M times (kernel.m0)
+for (int64_t i = 0; i < kernel.m0; ++i) { 
+    // Emit Instructions
+}
+
+```
+
+### Summary of Synchronized Values
+
+If you want to move from **Configuration A** (N=32, M=4) to **Configuration B** (N=16, M=8), you change:
+
+| File | Variable / Code | Config A (N=32) | Config B (N=16) | Math Reason |
+| --- | --- | --- | --- | --- |
+| **CPUEncoding** | `int N0` | `elementsPerReg * 4` | `elementsPerReg * 2` | $N = \text{RegSize} \times \text{LMUL}$ |
+| **KernelDispatch** | `targetLMUL` | `4` | `2` | Controls $N$ calculation |
+| **KernelDispatch** | `sizes` | `{4, nSize, 1}` | `{8, nSize, 1}` | Sets Loop Unroll $M$ |
+| **CustomKernels** | `kernel.n0` | `32` | `16` | Vector Length |
+| **CustomKernels** | `kernel.m0` | `4` | `8` | Loop Count |
+| **CustomKernels** | `accRegSize` | `32` | `16` | Matches $N$ |
+| **CustomKernels** | `VectorType` | `{8}` | `{4}` | $\text{count} = N / 4$ |
+| **CustomKernels** | `VL Constant` | `32` | `16` | Matches $N$ |

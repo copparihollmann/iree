@@ -1,0 +1,211 @@
+
+[0] Code Region
+
+Iterations:        100
+Instructions:      3100
+Total Cycles:      4001
+Total uOps:        3100
+
+Dispatch Width:    2
+uOps Per Cycle:    0.77
+IPC:               0.77
+Block RThroughput: 24.0
+
+
+Instruction Info:
+[1]: #uOps
+[2]: Latency
+[3]: RThroughput
+[4]: MayLoad
+[5]: MayStore
+[6]: HasSideEffects (U)
+
+[1]    [2]    [3]    [4]    [5]    [6]    Instructions:
+ 1      1     1.00                  U     vsetvli	zero, zero, e8, mf2, ta, ma
+ 1      3     3.00    *                   vle8.v	v24, (t1)
+ 1      4     0.50    *                   lbu	a1, -3(a3)
+ 1      4     0.50    *                   lbu	a0, -2(a3)
+ 1      4     0.50    *                   lbu	a2, -1(a3)
+ 1      4     0.50    *                   lbu	a4, 0(a3)
+ 1      4     1.00                        vwmul.vx	v25, v24, a1
+ 1      4     1.00                        vwmul.vx	v26, v24, a0
+ 1      4     1.00                        vwmul.vx	v27, v24, a2
+ 1      4     1.00                        vwmul.vx	v28, v24, a4
+ 1      4     0.50    *                   lbu	a0, 1(a3)
+ 1      4     0.50    *                   lbu	a1, 2(a3)
+ 1      4     0.50    *                   lbu	a2, 3(a3)
+ 1      4     0.50    *                   lbu	a4, 4(a3)
+ 1      4     1.00                        vwmul.vx	v29, v24, a0
+ 1      4     1.00                        vwmul.vx	v30, v24, a1
+ 1      4     1.00                        vwmul.vx	v31, v24, a2
+ 1      1     0.50                        addi	t1, t1, 16
+ 1      1     0.50                        addi	a5, a5, -16
+ 1      4     1.00                        vwmul.vx	v7, v24, a4
+ 1      1     1.00                  U     vsetvli	zero, zero, e16, m1, tu, ma
+ 1      4     2.00                        vwadd.wv	v8, v8, v25
+ 1      4     2.00                        vwadd.wv	v22, v22, v26
+ 1      4     2.00                        vwadd.wv	v20, v20, v27
+ 1      4     2.00                        vwadd.wv	v18, v18, v28
+ 1      4     2.00                        vwadd.wv	v16, v16, v29
+ 1      4     2.00                        vwadd.wv	v12, v12, v30
+ 1      4     2.00                        vwadd.wv	v14, v14, v31
+ 1      4     2.00                        vwadd.wv	v10, v10, v7
+ 1      1     0.50                        addi	a3, a3, 8
+ 1      1     1.00                        bnez	a5, .LBB0_1
+
+
+Resources:
+[0]   - SMX60_FP
+[1]   - SMX60_IEUA
+[2]   - SMX60_IEUB
+[3.0] - SMX60_LS
+[3.1] - SMX60_LS
+[4]   - SMX60_VFP
+[5]   - SMX60_VIEU
+[6]   - SMX60_VLS
+
+
+Resource pressure per iteration:
+[0]    [1]    [2]    [3.0]  [3.1]  [4]    [5]    [6]    
+ -     4.00   2.00   4.00   4.00    -     24.00  3.00   
+
+Resource pressure by instruction:
+[0]    [1]    [2]    [3.0]  [3.1]  [4]    [5]    [6]    Instructions:
+ -     1.00    -      -      -      -      -      -     vsetvli	zero, zero, e8, mf2, ta, ma
+ -      -      -      -      -      -      -     3.00   vle8.v	v24, (t1)
+ -      -      -      -     1.00    -      -      -     lbu	a1, -3(a3)
+ -      -      -     1.00    -      -      -      -     lbu	a0, -2(a3)
+ -      -      -      -     1.00    -      -      -     lbu	a2, -1(a3)
+ -      -      -     1.00    -      -      -      -     lbu	a4, 0(a3)
+ -      -      -      -      -      -     1.00    -     vwmul.vx	v25, v24, a1
+ -      -      -      -      -      -     1.00    -     vwmul.vx	v26, v24, a0
+ -      -      -      -      -      -     1.00    -     vwmul.vx	v27, v24, a2
+ -      -      -      -      -      -     1.00    -     vwmul.vx	v28, v24, a4
+ -      -      -      -     1.00    -      -      -     lbu	a0, 1(a3)
+ -      -      -     1.00    -      -      -      -     lbu	a1, 2(a3)
+ -      -      -      -     1.00    -      -      -     lbu	a2, 3(a3)
+ -      -      -     1.00    -      -      -      -     lbu	a4, 4(a3)
+ -      -      -      -      -      -     1.00    -     vwmul.vx	v29, v24, a0
+ -      -      -      -      -      -     1.00    -     vwmul.vx	v30, v24, a1
+ -      -      -      -      -      -     1.00    -     vwmul.vx	v31, v24, a2
+ -      -     1.00    -      -      -      -      -     addi	t1, t1, 16
+ -     1.00    -      -      -      -      -      -     addi	a5, a5, -16
+ -      -      -      -      -      -     1.00    -     vwmul.vx	v7, v24, a4
+ -     1.00    -      -      -      -      -      -     vsetvli	zero, zero, e16, m1, tu, ma
+ -      -      -      -      -      -     2.00    -     vwadd.wv	v8, v8, v25
+ -      -      -      -      -      -     2.00    -     vwadd.wv	v22, v22, v26
+ -      -      -      -      -      -     2.00    -     vwadd.wv	v20, v20, v27
+ -      -      -      -      -      -     2.00    -     vwadd.wv	v18, v18, v28
+ -      -      -      -      -      -     2.00    -     vwadd.wv	v16, v16, v29
+ -      -      -      -      -      -     2.00    -     vwadd.wv	v12, v12, v30
+ -      -      -      -      -      -     2.00    -     vwadd.wv	v14, v14, v31
+ -      -      -      -      -      -     2.00    -     vwadd.wv	v10, v10, v7
+ -      -     1.00    -      -      -      -      -     addi	a3, a3, 8
+ -     1.00    -      -      -      -      -      -     bnez	a5, .LBB0_1
+
+
+Timeline view:
+                    0123456789          0123456789          0123456789          0123456789
+Index     0123456789          0123456789          0123456789          0123456789          
+
+[0,0]     DE   .    .    .    .    .    .    .    .    .    .    .    .    .    .    .   .   vsetvli	zero, zero, e8, mf2, ta, ma
+[0,1]     .DeeE.    .    .    .    .    .    .    .    .    .    .    .    .    .    .   .   vle8.v	v24, (t1)
+[0,2]     .DeeeE    .    .    .    .    .    .    .    .    .    .    .    .    .    .   .   lbu	a1, -3(a3)
+[0,3]     . DeeeE   .    .    .    .    .    .    .    .    .    .    .    .    .    .   .   lbu	a0, -2(a3)
+[0,4]     . DeeeE   .    .    .    .    .    .    .    .    .    .    .    .    .    .   .   lbu	a2, -1(a3)
+[0,5]     .  DeeeE  .    .    .    .    .    .    .    .    .    .    .    .    .    .   .   lbu	a4, 0(a3)
+[0,6]     .    DeeeE.    .    .    .    .    .    .    .    .    .    .    .    .    .   .   vwmul.vx	v25, v24, a1
+[0,7]     .    .DeeeE    .    .    .    .    .    .    .    .    .    .    .    .    .   .   vwmul.vx	v26, v24, a0
+[0,8]     .    . DeeeE   .    .    .    .    .    .    .    .    .    .    .    .    .   .   vwmul.vx	v27, v24, a2
+[0,9]     .    .  DeeeE  .    .    .    .    .    .    .    .    .    .    .    .    .   .   vwmul.vx	v28, v24, a4
+[0,10]    .    .  DeeeE  .    .    .    .    .    .    .    .    .    .    .    .    .   .   lbu	a0, 1(a3)
+[0,11]    .    .   DeeeE .    .    .    .    .    .    .    .    .    .    .    .    .   .   lbu	a1, 2(a3)
+[0,12]    .    .   DeeeE .    .    .    .    .    .    .    .    .    .    .    .    .   .   lbu	a2, 3(a3)
+[0,13]    .    .    DeeeE.    .    .    .    .    .    .    .    .    .    .    .    .   .   lbu	a4, 4(a3)
+[0,14]    .    .    . DeeeE   .    .    .    .    .    .    .    .    .    .    .    .   .   vwmul.vx	v29, v24, a0
+[0,15]    .    .    .  DeeeE  .    .    .    .    .    .    .    .    .    .    .    .   .   vwmul.vx	v30, v24, a1
+[0,16]    .    .    .   DeeeE .    .    .    .    .    .    .    .    .    .    .    .   .   vwmul.vx	v31, v24, a2
+[0,17]    .    .    .    . DE .    .    .    .    .    .    .    .    .    .    .    .   .   addi	t1, t1, 16
+[0,18]    .    .    .    . DE .    .    .    .    .    .    .    .    .    .    .    .   .   addi	a5, a5, -16
+[0,19]    .    .    .    .  DeeeE  .    .    .    .    .    .    .    .    .    .    .   .   vwmul.vx	v7, v24, a4
+[0,20]    .    .    .    .    .DE  .    .    .    .    .    .    .    .    .    .    .   .   vsetvli	zero, zero, e16, m1, tu, ma
+[0,21]    .    .    .    .    . DeeeE   .    .    .    .    .    .    .    .    .    .   .   vwadd.wv	v8, v8, v25
+[0,22]    .    .    .    .    .   DeeeE .    .    .    .    .    .    .    .    .    .   .   vwadd.wv	v22, v22, v26
+[0,23]    .    .    .    .    .    .DeeeE    .    .    .    .    .    .    .    .    .   .   vwadd.wv	v20, v20, v27
+[0,24]    .    .    .    .    .    .  DeeeE  .    .    .    .    .    .    .    .    .   .   vwadd.wv	v18, v18, v28
+[0,25]    .    .    .    .    .    .    DeeeE.    .    .    .    .    .    .    .    .   .   vwadd.wv	v16, v16, v29
+[0,26]    .    .    .    .    .    .    . DeeeE   .    .    .    .    .    .    .    .   .   vwadd.wv	v12, v12, v30
+[0,27]    .    .    .    .    .    .    .   DeeeE .    .    .    .    .    .    .    .   .   vwadd.wv	v14, v14, v31
+[0,28]    .    .    .    .    .    .    .    .DeeeE    .    .    .    .    .    .    .   .   vwadd.wv	v10, v10, v7
+[0,29]    .    .    .    .    .    .    .    .   DE    .    .    .    .    .    .    .   .   addi	a3, a3, 8
+[0,30]    .    .    .    .    .    .    .    .   DE    .    .    .    .    .    .    .   .   bnez	a5, .LBB0_1
+[1,0]     .    .    .    .    .    .    .    .    DE   .    .    .    .    .    .    .   .   vsetvli	zero, zero, e8, mf2, ta, ma
+[1,1]     .    .    .    .    .    .    .    .    .DeeE.    .    .    .    .    .    .   .   vle8.v	v24, (t1)
+[1,2]     .    .    .    .    .    .    .    .    .DeeeE    .    .    .    .    .    .   .   lbu	a1, -3(a3)
+[1,3]     .    .    .    .    .    .    .    .    . DeeeE   .    .    .    .    .    .   .   lbu	a0, -2(a3)
+[1,4]     .    .    .    .    .    .    .    .    . DeeeE   .    .    .    .    .    .   .   lbu	a2, -1(a3)
+[1,5]     .    .    .    .    .    .    .    .    .  DeeeE  .    .    .    .    .    .   .   lbu	a4, 0(a3)
+[1,6]     .    .    .    .    .    .    .    .    .    DeeeE.    .    .    .    .    .   .   vwmul.vx	v25, v24, a1
+[1,7]     .    .    .    .    .    .    .    .    .    .DeeeE    .    .    .    .    .   .   vwmul.vx	v26, v24, a0
+[1,8]     .    .    .    .    .    .    .    .    .    . DeeeE   .    .    .    .    .   .   vwmul.vx	v27, v24, a2
+[1,9]     .    .    .    .    .    .    .    .    .    .  DeeeE  .    .    .    .    .   .   vwmul.vx	v28, v24, a4
+[1,10]    .    .    .    .    .    .    .    .    .    .  DeeeE  .    .    .    .    .   .   lbu	a0, 1(a3)
+[1,11]    .    .    .    .    .    .    .    .    .    .   DeeeE .    .    .    .    .   .   lbu	a1, 2(a3)
+[1,12]    .    .    .    .    .    .    .    .    .    .   DeeeE .    .    .    .    .   .   lbu	a2, 3(a3)
+[1,13]    .    .    .    .    .    .    .    .    .    .    DeeeE.    .    .    .    .   .   lbu	a4, 4(a3)
+[1,14]    .    .    .    .    .    .    .    .    .    .    . DeeeE   .    .    .    .   .   vwmul.vx	v29, v24, a0
+[1,15]    .    .    .    .    .    .    .    .    .    .    .  DeeeE  .    .    .    .   .   vwmul.vx	v30, v24, a1
+[1,16]    .    .    .    .    .    .    .    .    .    .    .   DeeeE .    .    .    .   .   vwmul.vx	v31, v24, a2
+[1,17]    .    .    .    .    .    .    .    .    .    .    .    . DE .    .    .    .   .   addi	t1, t1, 16
+[1,18]    .    .    .    .    .    .    .    .    .    .    .    . DE .    .    .    .   .   addi	a5, a5, -16
+[1,19]    .    .    .    .    .    .    .    .    .    .    .    .  DeeeE  .    .    .   .   vwmul.vx	v7, v24, a4
+[1,20]    .    .    .    .    .    .    .    .    .    .    .    .    .DE  .    .    .   .   vsetvli	zero, zero, e16, m1, tu, ma
+[1,21]    .    .    .    .    .    .    .    .    .    .    .    .    . DeeeE   .    .   .   vwadd.wv	v8, v8, v25
+[1,22]    .    .    .    .    .    .    .    .    .    .    .    .    .   DeeeE .    .   .   vwadd.wv	v22, v22, v26
+[1,23]    .    .    .    .    .    .    .    .    .    .    .    .    .    .DeeeE    .   .   vwadd.wv	v20, v20, v27
+[1,24]    .    .    .    .    .    .    .    .    .    .    .    .    .    .  DeeeE  .   .   vwadd.wv	v18, v18, v28
+[1,25]    .    .    .    .    .    .    .    .    .    .    .    .    .    .    DeeeE.   .   vwadd.wv	v16, v16, v29
+[1,26]    .    .    .    .    .    .    .    .    .    .    .    .    .    .    . DeeeE  .   vwadd.wv	v12, v12, v30
+[1,27]    .    .    .    .    .    .    .    .    .    .    .    .    .    .    .   DeeeE.   vwadd.wv	v14, v14, v31
+Truncated display due to cycle limit
+
+
+Average Wait times (based on the timeline view):
+[0]: Executions
+[1]: Average time spent waiting in a scheduler's queue
+[2]: Average time spent waiting in a scheduler's queue while ready
+[3]: Average time elapsed from WB until retire stage
+
+      [0]    [1]    [2]    [3]
+0.     10    0.0    0.0    0.0       vsetvli	zero, zero, e8, mf2, ta, ma
+1.     10    0.0    0.0    0.0       vle8.v	v24, (t1)
+2.     10    0.0    0.0    0.0       lbu	a1, -3(a3)
+3.     10    0.0    0.0    0.0       lbu	a0, -2(a3)
+4.     10    0.0    0.0    0.0       lbu	a2, -1(a3)
+5.     10    0.0    0.0    0.0       lbu	a4, 0(a3)
+6.     10    0.0    0.0    0.0       vwmul.vx	v25, v24, a1
+7.     10    0.0    0.0    0.0       vwmul.vx	v26, v24, a0
+8.     10    0.0    0.0    0.0       vwmul.vx	v27, v24, a2
+9.     10    0.0    0.0    0.0       vwmul.vx	v28, v24, a4
+10.    10    0.0    0.0    0.0       lbu	a0, 1(a3)
+11.    10    0.0    0.0    0.0       lbu	a1, 2(a3)
+12.    10    0.0    0.0    0.0       lbu	a2, 3(a3)
+13.    10    0.0    0.0    0.0       lbu	a4, 4(a3)
+14.    10    0.0    0.0    0.0       vwmul.vx	v29, v24, a0
+15.    10    0.0    0.0    0.0       vwmul.vx	v30, v24, a1
+16.    10    0.0    0.0    0.0       vwmul.vx	v31, v24, a2
+17.    10    0.0    0.0    0.0       addi	t1, t1, 16
+18.    10    0.0    0.0    0.0       addi	a5, a5, -16
+19.    10    0.0    0.0    0.0       vwmul.vx	v7, v24, a4
+20.    10    0.0    0.0    0.0       vsetvli	zero, zero, e16, m1, tu, ma
+21.    10    0.0    0.0    0.0       vwadd.wv	v8, v8, v25
+22.    10    0.0    0.0    0.0       vwadd.wv	v22, v22, v26
+23.    10    0.0    0.0    0.0       vwadd.wv	v20, v20, v27
+24.    10    0.0    0.0    0.0       vwadd.wv	v18, v18, v28
+25.    10    0.0    0.0    0.0       vwadd.wv	v16, v16, v29
+26.    10    0.0    0.0    0.0       vwadd.wv	v12, v12, v30
+27.    10    0.0    0.0    0.0       vwadd.wv	v14, v14, v31
+28.    10    0.0    0.0    0.0       vwadd.wv	v10, v10, v7
+29.    10    0.0    0.0    0.0       addi	a3, a3, 8
+30.    10    0.0    0.0    0.0       bnez	a5, .LBB0_1
+       10    0.0    0.0    0.0       <total>
