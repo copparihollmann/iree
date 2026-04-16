@@ -1153,6 +1153,7 @@ static Operation *lowerOPUContractionToUkernel(
     return nullptr;
   }
 
+
   // Extract tile counts (dynamic) and tile sizes (static) from packed shapes.
   // LHS shape: [M, K, M0, K0]
   // RHS shape: [N, K, N0, K0]
@@ -1249,6 +1250,15 @@ struct OPUEncodingPackedLayoutMaterializerAttr final
     bool isNarrowOne = narrowDim && narrowDim.size == 1;
     bool hasBatch = !cDims->batch.empty();
 
+    // Saturn OPU narrow-M fallback: `iree_uk_opu_matmul` hangs on Saturn
+    // for M < 128 (verified on vit_small dispatch 9, M=64). For these
+    // shapes, use the CPU tile enumeration (smaller tiles, RVV-friendly)
+    // instead of OPU 16×16 tiles. This produces a `linalg.mmt4d` with
+    // CPU-style packing that flows through the RVV vectorization path,
+    // sidestepping the OPU ukernel narrow-M hang. Batch matmuls
+    // (attention QKV) still take the `hasBatch` branch below — their
+    // working mechanism is inline VOPACC through VectorContractCustomKernels.
+
     // For batch matmuls and vecmat: use the same OPU 16x16 tiles as
     // standard matmuls (not identity, not CPU-specific tiles). This ensures
     // consistent tile sizes across LHS, RHS, and result operands, avoiding
@@ -1257,7 +1267,12 @@ struct OPUEncodingPackedLayoutMaterializerAttr final
     if (hasBatch) {
       // Batch matmuls: use OPU 16×16 tiles for all operands.
       // Skip narrowDim to keep tiles consistent across operands.
+      // Prefer 32×32 when shapes allow — triggers sub32x32_full fast path
+      // in iree_uk_opu_matmul (4 matrix registers used concurrently).
+      // chooseMatmulTile falls back to 16×16 / 8×16 / 4×16 / 1×16 if the
+      // shape doesn't accommodate the larger tile.
       SmallVector<TileMxNxK> opuTiles = {
+          TileMxNxK{32, 32, 1},
           TileMxNxK{16, 16, 1},
           TileMxNxK{8, 16, 1},
           TileMxNxK{4, 16, 1},
@@ -1272,7 +1287,12 @@ struct OPUEncodingPackedLayoutMaterializerAttr final
       return std::move(tileInfo.value());
     }
     if (isNarrowOne) {
+      // Prefer 32×32 when shapes allow — triggers sub32x32_full fast path
+      // in iree_uk_opu_matmul (4 matrix registers used concurrently).
+      // chooseMatmulTile falls back to 16×16 / 8×16 / 4×16 / 1×16 if the
+      // shape doesn't accommodate the larger tile.
       SmallVector<TileMxNxK> opuTiles = {
+          TileMxNxK{32, 32, 1},
           TileMxNxK{16, 16, 1},
           TileMxNxK{8, 16, 1},
           TileMxNxK{4, 16, 1},
@@ -1292,17 +1312,37 @@ struct OPUEncodingPackedLayoutMaterializerAttr final
         return info; // Empty = identity layout
       }
 
-      // LHS/RHS: OPU hardware-width tiles. The OPU operates on 16×16
-      // matrix registers; larger tiles (32×32, 64×64) use 2×2/4×4 sub-tiling
-      // in the ukernel but produce large intermediate vectors during
-      // vectorization. Limit to 16×16 for encoding to avoid oversized vectors
-      // on V128 targets. The ukernel internally handles larger effective tiles.
-      SmallVector<TileMxNxK> opuTiles = {
-          TileMxNxK{16, 16, 1}, // OPU hardware tile
-          TileMxNxK{8, 16, 1},  // Narrow-M
-          TileMxNxK{4, 16, 1},  // Narrower-M
-          TileMxNxK{1, 16, 1},  // Vecmat
+      // LHS/RHS: OPU hardware-width tiles. Prefer 32×32 when shapes
+      // allow — it triggers the sub32x32_full fast path in
+      // iree_uk_opu_matmul (4 matrix registers used concurrently).
+      // chooseMatmulTile falls back to 16×16 / 8×16 / 4×16 / 1×16 if
+      // the shape doesn't accommodate the larger tile.
+      // Gate 32×32 on iteration sizes: chooseMatmulTile only computes
+      // paddingPenalty when narrowDim is set, so for a "balanced"
+      // small matmul like 16×16×16 (mlp_wide) it would otherwise pick
+      // 32×32 by volume and silently pad M to 32 → OOB writes / hang.
+      // Only advertise tiles whose M ≤ iteration-M and N ≤ iteration-N.
+      int64_t iterM = 0, iterN = 0;
+      FailureOr<IREE::Encoding::BxMxNxKxKb> sizes =
+          IREE::Encoding::getEncodingContractionLikeSizes(encoding);
+      if (succeeded(sizes)) {
+        iterM = sizes->M;
+        iterN = sizes->N;
+      }
+      auto fits = [&](TileMxNxK t) {
+        return (iterM == 0 || t.M <= iterM) && (iterN == 0 || t.N <= iterN);
       };
+      SmallVector<TileMxNxK> opuTiles;
+      for (TileMxNxK t : SmallVector<TileMxNxK>{
+               TileMxNxK{32, 32, 1}, // OPU 32×32 fast path (M,N >= 32)
+               TileMxNxK{16, 16, 1}, // OPU hardware tile
+               TileMxNxK{8, 16, 1},  // Narrow-M
+               TileMxNxK{4, 16, 1},  // Narrower-M
+               TileMxNxK{1, 16, 1},  // Vecmat
+           }) {
+        if (fits(t)) opuTiles.push_back(t);
+      }
+      if (opuTiles.empty()) opuTiles.push_back(TileMxNxK{1, 16, 1});
       TileMxNxK chosenTileMxNxK = chooseMatmulTile(opuTiles, narrowDim);
       FailureOr<MaterializeEncodingInfo> maybeEncodingInfo =
           getEncodingInfoForMatmul(encoding, chosenTileMxNxK);

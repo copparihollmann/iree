@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "iree/hal/api.h"
 #include "iree/hal/local/elf/elf_module.h"
@@ -200,9 +201,95 @@ static iree_status_t iree_hal_elf_executable_issue_call(
                                                     library, ordinal);
   IREE_HAL_EXECUTABLE_LIBRARY_CALL_HOOK_BEGIN(executable->identifier, library,
                                               ordinal);
+  // Per-dispatch cycle accounting. We only print when the dispatch-debug
+  // gate is on (benchmark flips it post-setup). On the first workgroup of
+  // a dispatch we emit "[dn] o=N sym=S wg_count=X,Y,Z" so the offline
+  // parser can join the ordinal with the source model_dispatch_decomposition
+  // table. Every call (including workgroup 0) then emits "[dc] o=N
+  // wg=x,y,z cyc=C ret=R" so total dispatch cycles = sum over workgroups.
+  extern int iree_merlin_dispatch_debug_enabled;
+  const bool dbg = iree_merlin_dispatch_debug_enabled;
+  if (dbg && workgroup_state->workgroup_id_x == 0 &&
+      workgroup_state->workgroup_id_y == 0 &&
+      workgroup_state->workgroup_id_z == 0) {
+    const char* sym = (library->exports.names != NULL)
+                          ? library->exports.names[ordinal]
+                          : "(unknown)";
+    fprintf(stderr, "[dn] o=%zu sym=%s wg_count=%u,%u,%u\n", ordinal,
+            sym ? sym : "(null)",
+            dispatch_state->workgroup_count_x,
+            dispatch_state->workgroup_count_y,
+            dispatch_state->workgroup_count_z);
+    fflush(stderr);
+  }
+  // Phase-2 alignment dump (opt-in via iree_merlin_enable_binding_debug).
+  extern int iree_merlin_binding_debug_enabled;
+  if (iree_merlin_binding_debug_enabled) {
+    for (uint8_t i = 0; i < dispatch_state->binding_count; ++i) {
+      uintptr_t p = (uintptr_t)dispatch_state->binding_ptrs[i];
+      fprintf(stderr,
+              "[binding] o=%zu i=%u ptr=%p mod128=%lu mod64=%lu mod16=%lu "
+              "len=%lu\n",
+              ordinal, i, dispatch_state->binding_ptrs[i],
+              (unsigned long)(p & 0x7f), (unsigned long)(p & 0x3f),
+              (unsigned long)(p & 0x0f),
+              (unsigned long)dispatch_state->binding_lengths[i]);
+    }
+    fflush(stderr);
+  }
+  // Per-dispatch cycle accounting is split into TWO fully independent modes
+  // so they never contaminate each other's measurement:
+  //   (1) MERLIN_PROFILE_CYCLES=1 — wraps every ELF call with rdcycle, sums
+  //       into iree_merlin_cycles_per_ordinal[]. Used only for the OPU
+  //       compute-share decomposition plot. Costs ~8 cycles of overhead
+  //       per dispatch.
+  //   (2) MERLIN_DISPATCH_DEBUG=1 — verbose per-workgroup [dc] print.
+  //       Microtest use only; massive UART overhead.
+  //   (default, neither macro set) — clean run: nothing here but the ELF
+  //   call itself. Used for OPU-vs-RVV speedup measurement.
+#if defined(MERLIN_PROFILE_CYCLES) && MERLIN_PROFILE_CYCLES
+  uint64_t _c0 = 0, _c1 = 0;
+#if defined(__riscv)
+  __asm__ volatile("rdcycle %0" : "=r"(_c0));
+#endif
   int ret = iree_elf_call_i_ppp(library->exports.ptrs[ordinal],
                                 (void*)&base_executable->environment,
                                 (void*)dispatch_state, (void*)workgroup_state);
+#if defined(__riscv)
+  __asm__ volatile("rdcycle %0" : "=r"(_c1));
+#endif
+  extern uint64_t iree_merlin_cycles_per_ordinal[1024];
+  extern uint64_t iree_merlin_wg_count_per_ordinal[1024];
+  extern const char *iree_merlin_sym_per_ordinal[1024];
+  extern uint32_t iree_merlin_max_ordinal_seen;
+  if (ordinal < 1024) {
+    iree_merlin_cycles_per_ordinal[ordinal] += (_c1 - _c0);
+    iree_merlin_wg_count_per_ordinal[ordinal] += 1;
+    if (iree_merlin_sym_per_ordinal[ordinal] == NULL &&
+        library->exports.names != NULL) {
+      iree_merlin_sym_per_ordinal[ordinal] = library->exports.names[ordinal];
+    }
+    if (ordinal > iree_merlin_max_ordinal_seen) {
+      iree_merlin_max_ordinal_seen = (uint32_t)ordinal;
+    }
+  }
+#else
+  // Clean mode — pure ELF call, nothing else.
+  uint64_t _c0 = 0, _c1 = 0;
+  (void)_c0;
+  (void)_c1;
+  int ret = iree_elf_call_i_ppp(library->exports.ptrs[ordinal],
+                                (void*)&base_executable->environment,
+                                (void*)dispatch_state, (void*)workgroup_state);
+#endif
+  if (dbg) {
+    fprintf(stderr, "[dc] o=%zu wg=%u,%u,%u cyc=%llu ret=%d\n", ordinal,
+            workgroup_state->workgroup_id_x,
+            workgroup_state->workgroup_id_y,
+            workgroup_state->workgroup_id_z,
+            (unsigned long long)(_c1 - _c0), ret);
+    fflush(stderr);
+  }
   IREE_HAL_EXECUTABLE_LIBRARY_CALL_HOOK_END(executable->identifier, library,
                                             ordinal);
   IREE_TRACE_ZONE_END(z0);
