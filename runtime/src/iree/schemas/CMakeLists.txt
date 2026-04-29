@@ -55,6 +55,21 @@ flatbuffer_c_library(
 
 flatbuffer_c_library(
   NAME
+    cuda_tile_executable_def_c_fbs
+  SRCS
+    "cuda_tile_executable_def.fbs"
+  FLATCC_ARGS
+    "--reader"
+    "--builder"
+    "--verifier"
+    "--json"
+  INCLUDES
+    "executable_debug_info.fbs"
+  PUBLIC
+)
+
+flatbuffer_c_library(
+  NAME
     executable_debug_info_c_fbs
   SRCS
     "executable_debug_info.fbs"

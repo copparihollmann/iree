@@ -139,9 +139,6 @@ func.func @extf_vector_f8e5m2fnuz_to_f32(%arg0 : vector<4xf8E5M2FNUZ>) -> vector
 
 // -----
 
-<<<<<<< HEAD
-// CHECK-LABEL: func.func @truncf_f32_to_f8e4m3fnuz
-=======
 // Test vector extf emulation for CPU target with non-f32 destination.
 // CHECK-LABEL: func.func @extf_cpu_vector_f8e4m3fn_to_f16
 // CHECK-SAME:    (%[[ARG0:.*]]: vector<4xf8E4M3FN>) -> vector<4xf16>
@@ -160,8 +157,7 @@ func.func @extf_cpu_vector_f8e4m3fn_to_f16(%arg0 : vector<4xf8E4M3FN>) -> vector
 
 // Test f8E4M3FNUZ truncf emulation for CPU target.
 //
-// CHECK-LABEL: func.func @truncf_cpu_f32_to_f8e4m3fnuz
->>>>>>> 1df2f27916 ([Add] Support for fp8 based on smolVLA lowering to global-opt)
+// CHECK-LABEL: func.func @truncf_f32_to_f8e4m3fnuz
 // CHECK-SAME:    (%[[ARG0:.*]]: f32) -> f8E4M3FNUZ
 // CHECK:         %[[BITCAST:.*]] = arith.bitcast %[[ARG0]] : f32 to i32
 // CHECK:         arith.trunci %{{.*}} : i32 to i8
