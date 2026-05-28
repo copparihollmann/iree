@@ -55,6 +55,28 @@ using llvm::dbgs;
 namespace mlir::iree_compiler::IREE::HAL {
 namespace {
 
+// 2026-05-24: Opt-out for the Saturn OPU encoding resolver while keeping
+// `+xopu` cpu-feature enabled. Default behavior: `+xopu` → OPU encoding
+// resolver (data-tile via mmt4d → VOPACC ukernel). This is correct for
+// matmul-only nets (mlp_wide, tinyllama) but the OPU resolver currently
+// emits a `linalg.generic` wrapper that survives workgroup distribution
+// on im2col-produced matmul shapes (CNNs after conv→matmul conversion),
+// triggering `failed workgroup distribution verification` in
+// VerifyWorkgroupDistribution.cpp. Setting this flag falls back to the
+// generic CPU encoding resolver while keeping the rest of +xopu live:
+// scalarize-float-reduction safety, VectorContractCustomKernels OPU
+// patterns, and the OPU ukernel lowering path in CPULowerToUKernels —
+// so CNN dispatches still emit OPU `.insn` opcodes via the mmt4d
+// ukernel without tripping the resolver verifier.
+static llvm::cl::opt<bool> clDisableOPUEncodingResolver(
+    "iree-llvmcpu-disable-opu-encoding-resolver",
+    llvm::cl::desc("If true, skip the OPU encoding resolver even when "
+                   "`+xopu` is in cpu-features; falls back to the plain "
+                   "CPU encoding resolver. Use for CNN models where "
+                   "im2col-produced matmul shapes break the OPU "
+                   "encoding workgroup distribution verifier."),
+    llvm::cl::init(false));
+
 static constexpr char kQueryFunctionName[] =
     "iree_hal_executable_library_query";
 
@@ -176,7 +198,8 @@ public:
     target.storeToConfigAttrs(context, configItems);
     {
       Attribute encodingResolver;
-      if (target.getCpuFeatures().find("+xopu") != std::string::npos) {
+      if (target.getCpuFeatures().find("+xopu") != std::string::npos &&
+          !clDisableOPUEncodingResolver) {
         encodingResolver =
             IREE::CPU::OPUEncodingResolverAttr::get(context, {});
       } else {
