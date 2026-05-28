@@ -7,6 +7,7 @@
 #include "iree/hal/command_buffer.h"
 
 #include <stddef.h>
+#include <stdio.h>
 
 #include "iree/base/api.h"
 #include "iree/hal/command_buffer_validation.h"

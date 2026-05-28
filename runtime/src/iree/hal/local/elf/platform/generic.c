@@ -6,7 +6,7 @@
 
 #include "iree/hal/local/elf/platform.h"
 
-#if defined(IREE_PLATFORM_GENERIC)
+#if defined(IREE_PLATFORM_GENERIC) || defined(IREE_PLATFORM_ZEPHYR)
 
 #include <malloc.h>
 #include <stdlib.h>
@@ -49,4 +49,4 @@ iree_status_t iree_memory_view_protect_ranges(void* base_address,
   return iree_ok_status();
 }
 
-#endif  // IREE_PLATFORM_GENERIC
+#endif  // IREE_PLATFORM_GENERIC || IREE_PLATFORM_ZEPHYR

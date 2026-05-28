@@ -12,6 +12,24 @@ iree_add_all_subdirs()
 
 # Task-based executor requires threading support.
 if(NOT IREE_ENABLE_THREADING)
+  # Define empty stub targets so downstream consumers (e.g.
+  # runtime/src/iree/hal/drivers/local_task/registration/CMakeLists.txt
+  # which depends on iree::task::api) can still resolve the dep edge in
+  # CMake's generator graph. Setting IREE_HAL_DRIVER_LOCAL_TASK=OFF in
+  # tools/build.py is insufficient because the runtime's unified
+  # library walker collects iree::hal::drivers transitively which
+  # includes the local_task registration. With these stubs, the
+  # archives are empty (zero .o files) so they cost nothing at link.
+  iree_cc_library(
+    NAME
+      task
+    PUBLIC
+  )
+  iree_cc_library(
+    NAME
+      api
+    PUBLIC
+  )
   return()
 endif()
 

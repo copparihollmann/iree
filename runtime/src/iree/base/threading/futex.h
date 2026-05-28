@@ -45,7 +45,8 @@
 #if !IREE_SYNCHRONIZATION_DISABLE_UNSAFE
 
 #if defined(IREE_PLATFORM_ANDROID) || defined(IREE_PLATFORM_EMSCRIPTEN) || \
-    defined(IREE_PLATFORM_LINUX) || defined(IREE_PLATFORM_WINDOWS)
+    defined(IREE_PLATFORM_LINUX) || defined(IREE_PLATFORM_WINDOWS) ||      \
+    defined(IREE_PLATFORM_ZEPHYR)
 #define IREE_PLATFORM_HAS_FUTEX 1
 #endif  // IREE_PLATFORM_*
 
@@ -68,6 +69,11 @@
 #include <errno.h>
 #elif defined(IREE_PLATFORM_WINDOWS)
 // Windows headers included via iree/base/target_platform.h
+#elif defined(IREE_PLATFORM_ZEPHYR)
+// No kernel.h here — the iree_bar build sees IREE_PLATFORM_ZEPHYR=1 but is
+// compiled by a non-Zephyr toolchain (chipyard clang + newlib sysroot).
+// Zephyr headers are only available when the consuming app links against
+// Zephyr; the iree_futex_*_impl_zephyr definitions live there.
 #elif defined(IREE_PLATFORM_ANDROID) || defined(IREE_PLATFORM_LINUX)
 #include <errno.h>
 #include <linux/futex.h>
@@ -220,6 +226,36 @@ static inline void iree_futex_wake(void* address, int32_t count) {
 }
 
 // WaitOnAddress/WakeByAddress already hash by physical page on Windows.
+static inline iree_status_code_t iree_futex_wait_shared(
+    void* address, uint32_t expected_value, iree_time_t deadline_ns) {
+  return iree_futex_wait(address, expected_value, deadline_ns);
+}
+static inline void iree_futex_wake_shared(void* address, int32_t count) {
+  iree_futex_wake(address, count);
+}
+
+#elif defined(IREE_PLATFORM_ZEPHYR)
+
+// Zephyr has no kernel futex; we emulate via a fixed-size bucket pool of
+// k_mutex + k_condvar pairs hashed by address. Implementations live in
+// futex_zephyr.c — declared here as extern so the static-inline shape of
+// the other platform branches is preserved at the call site.
+extern iree_status_code_t iree_futex_wait_impl_zephyr(void* address,
+                                                     uint32_t expected_value,
+                                                     iree_time_t deadline_ns);
+extern void iree_futex_wake_impl_zephyr(void* address, int32_t count);
+
+static inline iree_status_code_t iree_futex_wait(void* address,
+                                                 uint32_t expected_value,
+                                                 iree_time_t deadline_ns) {
+  return iree_futex_wait_impl_zephyr(address, expected_value, deadline_ns);
+}
+
+static inline void iree_futex_wake(void* address, int32_t count) {
+  iree_futex_wake_impl_zephyr(address, count);
+}
+
+// No multi-process semantics on Zephyr — alias to private variants.
 static inline iree_status_code_t iree_futex_wait_shared(
     void* address, uint32_t expected_value, iree_time_t deadline_ns) {
   return iree_futex_wait(address, expected_value, deadline_ns);

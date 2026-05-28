@@ -269,6 +269,18 @@ enum iree_arch_enum_e {
 #endif  // __linux__
 
 //==============================================================================
+// IREE_PLATFORM_ZEPHYR
+//==============================================================================
+// Zephyr RTOS. Auto-detected from the __ZEPHYR__ macro that Zephyr's CMake
+// always defines at -D level. Coexists with IREE_PLATFORM_GENERIC fallback —
+// but when Zephyr is active our toolchain.cmake omits the GENERIC define so
+// auto-detect kicks in and pulls thread_zephyr.c / futex Zephyr branch.
+
+#if defined(__ZEPHYR__)
+#define IREE_PLATFORM_ZEPHYR 1
+#endif  // __ZEPHYR__
+
+//==============================================================================
 // IREE_PLATFORM_WINDOWS
 //==============================================================================
 
@@ -327,7 +339,8 @@ enum iree_arch_enum_e {
 #if !defined(IREE_PLATFORM_ANDROID) && !defined(IREE_PLATFORM_BSD) &&        \
     !defined(IREE_PLATFORM_EMSCRIPTEN) && !defined(IREE_PLATFORM_GENERIC) && \
     !defined(IREE_PLATFORM_IOS) && !defined(IREE_PLATFORM_LINUX) &&          \
-    !defined(IREE_PLATFORM_MACOS) && !defined(IREE_PLATFORM_WINDOWS)
+    !defined(IREE_PLATFORM_MACOS) && !defined(IREE_PLATFORM_WINDOWS) &&      \
+    !defined(IREE_PLATFORM_ZEPHYR)
 #error Unknown platform.
 #endif  // all archs
 

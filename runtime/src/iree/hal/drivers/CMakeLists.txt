@@ -152,6 +152,11 @@ if(IREE_HAL_DRIVER_NULL)
   add_subdirectory(null)
   list(APPEND _INIT_INTERNAL_DEPS iree::hal::drivers::null::registration)
 endif()
+# NOTE: QNN HAL driver lives at the Merlin level
+# (runtime/src/iree/hal/drivers/qnn/) and is registered via
+# iree_runtime_plugin.cmake → iree_register_external_hal_driver(qnn).
+# The driver is therefore included via IREE_EXTERNAL_HAL_DRIVERS, not via
+# add_subdirectory here.
 if(IREE_HAL_DRIVER_VULKAN)
   add_subdirectory(vulkan)
   list(APPEND _INIT_INTERNAL_DEPS iree::hal::drivers::vulkan::registration)
