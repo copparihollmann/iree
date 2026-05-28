@@ -43,6 +43,12 @@ void iree_merlin_enable_binding_debug(int enable) {
 #define IREE_MERLIN_MAX_ORDINALS 1024
 uint64_t iree_merlin_cycles_per_ordinal[IREE_MERLIN_MAX_ORDINALS] = {0};
 uint64_t iree_merlin_wg_count_per_ordinal[IREE_MERLIN_MAX_ORDINALS] = {0};
+// Per-ordinal Gemmini counter accumulator. 8 slots per ordinal, accumulated
+// (post-pre) per dispatch invocation by embedded_elf_loader.c when
+// MERLIN_PROFILE_COUNTERS is set. The 8-slot panel is programmed once at
+// worker startup via merlin_gemmini_counter_panel_init() in
+// merlin_gemmini_counter.h.
+uint64_t iree_merlin_counters_per_ordinal[IREE_MERLIN_MAX_ORDINALS][8] = {{0}};
 // Symbol name lookup, captured from library->exports.names when seen.
 // Kept as const char* (pointers into the .rodata string table of the
 // embedded ELF; valid for the lifetime of the HAL executable which
@@ -62,6 +68,35 @@ void iree_merlin_dump_cycles(void) {
                 (unsigned long long)iree_merlin_wg_count_per_ordinal[o]);
     }
     fprintf(stdout, "CYC, end\n");
+    fflush(stdout);
+}
+
+// Counter dump: one line per dispatch with 8 slot accumulators. Format:
+//   COUNTER, <ordinal>, <symbol>, <slot0>, <slot1>, ..., <slot7>
+// The 8-slot panel is documented in
+// runtime/src/iree/hal/local/loaders/merlin_gemmini_counter.h
+// (MERLIN_GEMMINI_COUNTER_PANEL). parse_counters.py decodes this into a
+// per-counter CSV keyed by (model, ordinal, slot_name).
+//
+// Safe to call unconditionally — when MERLIN_PROFILE_COUNTERS is not set,
+// all slot values stay zero and the dump still emits but with zero data
+// (the parser treats all-zero rows as "counters disabled").
+void iree_merlin_dump_counters(void) {
+    fprintf(stdout, "COUNTER, begin\n");
+    for (uint32_t o = 0; o <= iree_merlin_max_ordinal_seen &&
+                        o < IREE_MERLIN_MAX_ORDINALS; ++o) {
+        if (iree_merlin_wg_count_per_ordinal[o] == 0) continue;
+        const char *sym = iree_merlin_sym_per_ordinal[o];
+        if (!sym) sym = "(unknown)";
+        fprintf(stdout, "COUNTER, %u, %s",
+                (unsigned)o, sym);
+        for (int s = 0; s < 8; ++s) {
+            fprintf(stdout, ", %llu",
+                    (unsigned long long)iree_merlin_counters_per_ordinal[o][s]);
+        }
+        fprintf(stdout, "\n");
+    }
+    fprintf(stdout, "COUNTER, end\n");
     fflush(stdout);
 }
 

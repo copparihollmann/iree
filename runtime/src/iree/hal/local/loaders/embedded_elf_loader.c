@@ -17,7 +17,61 @@
 #include "iree/hal/local/executable_library.h"
 #include "iree/hal/local/executable_library_util.h"
 #include "iree/hal/local/executable_plugin_manager.h"
+#include "iree/hal/local/loaders/merlin_debug_addresses.h"
+#include "iree/hal/local/loaders/merlin_gemmini_counter.h"
 #include "iree/hal/local/local_executable.h"
+
+//===----------------------------------------------------------------------===//
+// Merlin per-dispatch cycle log (minimal-overhead in-memory ring).
+//
+// Each entry is 24 bytes; a 256-entry ring covers any practical model and
+// fits in ~6 KB of BSS. Recording is a tight inlined sequence: read the
+// global index, store a 24-byte row, increment the index. No printf, no
+// mutex, no fence (the caller already did a fence rw,rw to commit the
+// preceding rdcycle/store ordering).
+//
+// main() in the Zephyr runner reads `merlin_dispatch_log` and
+// `merlin_dispatch_log_count` after k_thread_join and prints once.
+//===----------------------------------------------------------------------===//
+
+/* 2026-05-22: bumped from 256 to 4096. yolov8n × scalar has 225 dispatches
+ * and each can fan out to many workgroups (e.g. 25 for the 3136x32 elementwise
+ * broadcast initializers), easily exceeding 256 (ord, wg) tuples. The ring
+ * buffer is silently dropped on overflow → missing profile data. 4096 × 24
+ * bytes = 96 KiB of BSS, well within our budget. */
+#define MERLIN_DISPATCH_LOG_CAPACITY 4096
+
+typedef struct {
+  uint32_t ordinal;
+  uint32_t wg_x;
+  uint32_t wg_y;
+  uint32_t wg_z;
+  uint64_t cycles;
+  int32_t ret;
+  int32_t _pad;
+} merlin_dispatch_log_entry_t;
+
+__attribute__((visibility("default")))
+merlin_dispatch_log_entry_t
+    merlin_dispatch_log[MERLIN_DISPATCH_LOG_CAPACITY] = {0};
+
+__attribute__((visibility("default")))
+uint32_t merlin_dispatch_log_count = 0;
+
+static inline void merlin_dispatch_log_record(uint32_t ordinal, uint32_t wg_x,
+                                              uint32_t wg_y, uint32_t wg_z,
+                                              uint64_t cycles, int ret) {
+  uint32_t i = merlin_dispatch_log_count;
+  if (i < MERLIN_DISPATCH_LOG_CAPACITY) {
+    merlin_dispatch_log[i].ordinal = ordinal;
+    merlin_dispatch_log[i].wg_x = wg_x;
+    merlin_dispatch_log[i].wg_y = wg_y;
+    merlin_dispatch_log[i].wg_z = wg_z;
+    merlin_dispatch_log[i].cycles = cycles;
+    merlin_dispatch_log[i].ret = (int32_t)ret;
+    merlin_dispatch_log_count = i + 1;
+  }
+}
 
 //===----------------------------------------------------------------------===//
 // iree_hal_elf_executable_t
@@ -201,12 +255,17 @@ static iree_status_t iree_hal_elf_executable_issue_call(
                                                     library, ordinal);
   IREE_HAL_EXECUTABLE_LIBRARY_CALL_HOOK_BEGIN(executable->identifier, library,
                                               ordinal);
-  // Per-dispatch cycle accounting. We only print when the dispatch-debug
-  // gate is on (benchmark flips it post-setup). On the first workgroup of
-  // a dispatch we emit "[dn] o=N sym=S wg_count=X,Y,Z" so the offline
-  // parser can join the ordinal with the source model_dispatch_decomposition
-  // table. Every call (including workgroup 0) then emits "[dc] o=N
-  // wg=x,y,z cyc=C ret=R" so total dispatch cycles = sum over workgroups.
+#if defined(MERLIN_DISPATCH_DEBUG) && MERLIN_DISPATCH_DEBUG
+  // Per-dispatch debug printouts. Compiled in only under
+  // -DMERLIN_GEMMINI_COUNTERS=ON's sibling option MERLIN_DISPATCH_DEBUG=ON;
+  // off by default. Two runtime globals further gate emission so the
+  // harness can flip them on/off mid-run (e.g. skip warm-up):
+  //   iree_merlin_dispatch_debug_enabled  -> [dn]/[entry]/[bcontent]/[dc]
+  //   iree_merlin_binding_debug_enabled   -> [binding] alignment dump
+  // On the first workgroup of a dispatch we emit "[dn] o=N sym=S
+  // wg_count=X,Y,Z" so an offline parser can join the ordinal with the
+  // source model_dispatch_decomposition table. After the call we emit
+  // "[dc] o=N wg=x,y,z cyc=C ret=R" per workgroup.
   extern int iree_merlin_dispatch_debug_enabled;
   const bool dbg = iree_merlin_dispatch_debug_enabled;
   if (dbg && workgroup_state->workgroup_id_x == 0 &&
@@ -222,7 +281,6 @@ static iree_status_t iree_hal_elf_executable_issue_call(
             dispatch_state->workgroup_count_z);
     fflush(stderr);
   }
-  // Phase-2 alignment dump (opt-in via iree_merlin_enable_binding_debug).
   extern int iree_merlin_binding_debug_enabled;
   if (iree_merlin_binding_debug_enabled) {
     for (uint8_t i = 0; i < dispatch_state->binding_count; ++i) {
@@ -237,6 +295,29 @@ static iree_status_t iree_hal_elf_executable_issue_call(
     }
     fflush(stderr);
   }
+#endif  // MERLIN_DISPATCH_DEBUG
+
+  // Merlin Zephyr-on-FireSim correctness fences (separate from profiling).
+  //
+  // (1) Memory ordering barrier before entering the dispatch ELF.
+  // Why: the CPU stages dispatch state and binding pointers into shared
+  // memory just before calling here. Inside the ELF, the first RoCC k_MVIN
+  // hands those pointers to Gemmini's DMA engine, which reads memory through
+  // an independent port at the coherency point — NOT through the CPU's
+  // store buffer. Without an explicit `fence rw,rw` the CPU's setup stores
+  // can still be sitting in the store buffer when Gemmini's DMA starts, and
+  // the accelerator either reads stale bytes or hangs waiting for data that
+  // never arrives. Diagnosed 2026-05-14 on FireSimGemminiAndOPUShuttleConfig.
+  //
+  // (2) mstatus.VS = Dirty arm.
+  // On hetero workloads where this hart's worker thread may have yielded
+  // (k_mutex / k_msgq pend inside the IREE call chain → idle thread
+  // context switch on this hart → mstatus restore dropped VS to Off
+  // because Zephyr's CONFIG_RISCV_ISA_EXT_V=n means the kernel doesn't
+  // track V state), we re-arm VS right before the dispatch entry. On
+  // harts without V hardware (Shuttle hart 0 in the Gemmini bitstream)
+  // the VS bits are WARL no-ops — safe.
+  //
   // Per-dispatch cycle accounting is split into TWO fully independent modes
   // so they never contaminate each other's measurement:
   //   (1) MERLIN_PROFILE_CYCLES=1 — wraps every ELF call with rdcycle, sums
@@ -247,8 +328,102 @@ static iree_status_t iree_hal_elf_executable_issue_call(
   //       Microtest use only; massive UART overhead.
   //   (default, neither macro set) — clean run: nothing here but the ELF
   //   call itself. Used for OPU-vs-RVV speedup measurement.
+#if defined(__riscv) && (__riscv_xlen == 64)
+  __asm__ volatile("csrs mstatus, %0" :: "r"(3UL << 9));
+  __asm__ volatile("fence rw,rw" ::: "memory");
+#endif
+#if defined(MERLIN_DISPATCH_DEBUG) && MERLIN_DISPATCH_DEBUG
+  // Phase-3 sub-dispatch debug: emit a marker line right before the
+  // dispatch ELF jal, AND a sample of the first 16 bytes of every input
+  // binding so we can see (a) the dispatch entered the ELF (vs hung in
+  // the loader) and (b) input data is materialized (vs zero/garbage).
+  // For a fixed ordinal list (Bug A subspan-offset diagnostic targets),
+  // additionally dump 16 bytes at canonical probe offsets and clear the
+  // matmul trace region with a sentinel so the post-call [mtrace] read
+  // can confirm whether the compiler-emitted trace stores executed.
+  if (dbg && workgroup_state->workgroup_id_x == 0 &&
+      workgroup_state->workgroup_id_y == 0 &&
+      workgroup_state->workgroup_id_z == 0) {
+    // Dispatch ordinals covered by the Bug A bprobe + trace-clear path.
+    // Tracks dronet's matmul dispatches and their immediate successors
+    // (non-intermediate matmuls at 2,7,10,16,19,25,28,31,32; successors
+    // 3,8,11,17,20,26,29,33; with_intermediate's 16-19 overlap). Refresh
+    // when the model's dispatch ordering changes.
+    static const uint32_t kBugAProbeOrdinals[] = {
+        2,  3,  7,  8, 10, 11, 16, 17,
+       18, 19, 20, 25, 26, 28, 29, 31, 32, 33,
+    };
+    bool is_bug_a_probe = false;
+    for (size_t pi = 0; pi < sizeof(kBugAProbeOrdinals) /
+                                 sizeof(kBugAProbeOrdinals[0]);
+         ++pi) {
+      if (ordinal == kBugAProbeOrdinals[pi]) {
+        is_bug_a_probe = true;
+        break;
+      }
+    }
+    fprintf(stderr, "[entry] o=%zu about to jal dispatch ELF\n", ordinal);
+    fflush(stderr);
+    for (uint8_t i = 0; i < dispatch_state->binding_count; ++i) {
+      const uint8_t *bp = (const uint8_t *)dispatch_state->binding_ptrs[i];
+      const size_t bl = (size_t)dispatch_state->binding_lengths[i];
+      if (bp == NULL || bl == 0) {
+        fprintf(stderr, "[bcontent] o=%zu i=%u ptr=NULL/empty len=%zu\n",
+                ordinal, i, bl);
+      } else {
+        const size_t n = bl < 16 ? bl : 16;
+        unsigned long sum = 0;
+        for (size_t k = 0; k < n; ++k) sum += bp[k];
+        fprintf(stderr,
+                "[bcontent] o=%zu i=%u ptr=%p len=%zu first16_sum=%lu "
+                "bytes=%02x %02x %02x %02x %02x %02x %02x %02x "
+                "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                ordinal, i, bp, bl, sum,
+                n>0?bp[0]:0,  n>1?bp[1]:0,  n>2?bp[2]:0,  n>3?bp[3]:0,
+                n>4?bp[4]:0,  n>5?bp[5]:0,  n>6?bp[6]:0,  n>7?bp[7]:0,
+                n>8?bp[8]:0,  n>9?bp[9]:0,  n>10?bp[10]:0,n>11?bp[11]:0,
+                n>12?bp[12]:0,n>13?bp[13]:0,n>14?bp[14]:0,n>15?bp[15]:0);
+        if (is_bug_a_probe) {
+          static const size_t probe_offsets[] = {
+              0, 2048, 2816, 4096, 4864, 6144, 18176};
+          for (size_t pi = 0;
+               pi < sizeof(probe_offsets) / sizeof(probe_offsets[0]); ++pi) {
+            const size_t off = probe_offsets[pi];
+            if (off + 16 > bl) continue;
+            const uint8_t* q = bp + off;
+            fprintf(stderr,
+                    "[bprobe] o=%zu i=%u +%zu bytes=%02x %02x %02x %02x %02x %02x %02x %02x "
+                    "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                    ordinal, i, off,
+                    q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7],
+                    q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15]);
+          }
+          if (i == 0) {
+            volatile uint64_t* trace =
+                (volatile uint64_t*)MERLIN_DEBUG_MATMUL_TRACE_ADDR;
+            for (int k = 0; k < 5; ++k)
+              trace[k] = MERLIN_DEBUG_TRACE_CLEAR_SENTINEL;
+          }
+        }
+      }
+    }
+    fflush(stderr);
+  }
+#endif  // MERLIN_DISPATCH_DEBUG
 #if defined(MERLIN_PROFILE_CYCLES) && MERLIN_PROFILE_CYCLES
   uint64_t _c0 = 0, _c1 = 0;
+#if defined(MERLIN_PROFILE_COUNTERS) && MERLIN_PROFILE_COUNTERS
+  // Sample Gemmini's 8 counters BEFORE the rdcycle window so the
+  // reported per-dispatch cycle count excludes counter-read RoCC
+  // overhead. Each counter read is a RoCC custom-3 op (~10-20 cycles
+  // through the RoCC pipeline); 8 reads pre + 8 reads post would add
+  // ~150-300 cycles per dispatch, which dominates iteration deltas at
+  // the 0.01% level. By moving the pre-reads outside the cycle window,
+  // the `cycles=` total stays comparable to MERLIN_PROFILE_COUNTERS=0
+  // builds within ~0.02% (just the 8 post-reads' contribution).
+  uint32_t _ctr_pre[8];
+  for (unsigned _i = 0; _i < 8; ++_i) _ctr_pre[_i] = merlin_gemmini_counter_read(_i);
+#endif
 #if defined(__riscv)
   __asm__ volatile("rdcycle %0" : "=r"(_c0));
 #endif
@@ -258,10 +433,18 @@ static iree_status_t iree_hal_elf_executable_issue_call(
 #if defined(__riscv)
   __asm__ volatile("rdcycle %0" : "=r"(_c1));
 #endif
+  // Post-dispatch fence (matches the pre-dispatch fence above) so Gemmini's
+  // DMA outputs are globally visible before subsequent CPU loads/stores.
+#if defined(__riscv) && (__riscv_xlen == 64)
+  __asm__ volatile("fence rw,rw" ::: "memory");
+#endif
   extern uint64_t iree_merlin_cycles_per_ordinal[1024];
   extern uint64_t iree_merlin_wg_count_per_ordinal[1024];
   extern const char *iree_merlin_sym_per_ordinal[1024];
   extern uint32_t iree_merlin_max_ordinal_seen;
+#if defined(MERLIN_PROFILE_COUNTERS) && MERLIN_PROFILE_COUNTERS
+  extern uint64_t iree_merlin_counters_per_ordinal[1024][8];
+#endif
   if (ordinal < 1024) {
     iree_merlin_cycles_per_ordinal[ordinal] += (_c1 - _c0);
     iree_merlin_wg_count_per_ordinal[ordinal] += 1;
@@ -272,7 +455,23 @@ static iree_status_t iree_hal_elf_executable_issue_call(
     if (ordinal > iree_merlin_max_ordinal_seen) {
       iree_merlin_max_ordinal_seen = (uint32_t)ordinal;
     }
+#if defined(MERLIN_PROFILE_COUNTERS) && MERLIN_PROFILE_COUNTERS
+    for (unsigned _i = 0; _i < 8; ++_i) {
+      uint32_t _post = merlin_gemmini_counter_read(_i);
+      // Wrap-safe diff: counters are 32-bit; the post-pre cast handles
+      // mid-dispatch wraparound for the small panel of cycle counters we
+      // care about (LD/EX/ST cycles, plus stall events).
+      iree_merlin_counters_per_ordinal[ordinal][_i] +=
+          (uint64_t)(uint32_t)(_post - _ctr_pre[_i]);
+    }
+#endif
   }
+  // 2026-05-24: merlin_dispatch_log_record() call removed from the hot
+  // path. The 256-entry ring buffer was only consumed by the old
+  // merlin_dispatch_dump() -> [disp] dump that we replaced with the
+  // compact per-ordinal CYC dump (iree_merlin_cycles_per_ordinal is the
+  // sufficient backing store). Saves ~20 cycles + 32 BSS bytes per
+  // workgroup call.
 #else
   // Clean mode — pure ELF call, nothing else.
   uint64_t _c0 = 0, _c1 = 0;
@@ -281,15 +480,39 @@ static iree_status_t iree_hal_elf_executable_issue_call(
   int ret = iree_elf_call_i_ppp(library->exports.ptrs[ordinal],
                                 (void*)&base_executable->environment,
                                 (void*)dispatch_state, (void*)workgroup_state);
+#if defined(__riscv) && (__riscv_xlen == 64)
+  // Post-dispatch fence (correctness, separate from profiling).
+  __asm__ volatile("fence rw,rw" ::: "memory");
 #endif
+#endif
+#if defined(MERLIN_DISPATCH_DEBUG) && MERLIN_DISPATCH_DEBUG
   if (dbg) {
     fprintf(stderr, "[dc] o=%zu wg=%u,%u,%u cyc=%llu ret=%d\n", ordinal,
             workgroup_state->workgroup_id_x,
             workgroup_state->workgroup_id_y,
             workgroup_state->workgroup_id_z,
             (unsigned long long)(_c1 - _c0), ret);
+    // Bug A trace readback: the compiler-emitted store at
+    // MERLIN_DEBUG_MATMUL_TRACE_ADDR populates this region with the i64
+    // A/B/C/D addresses the dispatch consumed. If the sentinel is intact,
+    // the trace stores didn't execute. Limited to the FC head ordinals
+    // that exercised the original subspan-offset bug.
+    if (ordinal == 16 || ordinal == 18) {
+      volatile uint64_t* trace =
+          (volatile uint64_t*)MERLIN_DEBUG_MATMUL_TRACE_ADDR;
+      fprintf(stderr,
+              "[mtrace] o=%zu sentinel=0x%016llx A=0x%016llx B=0x%016llx "
+              "C=0x%016llx D=0x%016llx\n",
+              ordinal,
+              (unsigned long long)trace[0],
+              (unsigned long long)trace[1],
+              (unsigned long long)trace[2],
+              (unsigned long long)trace[3],
+              (unsigned long long)trace[4]);
+    }
     fflush(stderr);
   }
+#endif  // MERLIN_DISPATCH_DEBUG
   IREE_HAL_EXECUTABLE_LIBRARY_CALL_HOOK_END(executable->identifier, library,
                                             ordinal);
   IREE_TRACE_ZONE_END(z0);

@@ -67,6 +67,12 @@ iree_cc_library(
   PUBLIC
 )
 
+# See loaders/CMakeLists.txt for the MERLIN_GEMMINI_COUNTERS option.
+set(_merlin_dcb_defines "")
+if(MERLIN_GEMMINI_COUNTERS)
+  list(APPEND _merlin_dcb_defines "MERLIN_PROFILE_COUNTERS=1")
+endif()
+
 iree_cc_library(
   NAME
     deferred_command_buffer
@@ -79,6 +85,8 @@ iree_cc_library(
     iree::base
     iree::base::internal::arena
     iree::hal
+  DEFINES
+    ${_merlin_dcb_defines}
   PUBLIC
 )
 

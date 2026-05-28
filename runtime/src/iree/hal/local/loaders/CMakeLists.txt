@@ -12,6 +12,33 @@ iree_add_all_subdirs()
 
 if(IREE_HAL_EXECUTABLE_LOADER_EMBEDDED_ELF)
 
+# Opt-in Gemmini per-dispatch hardware counter panel. Adds ~150
+# cycles per dispatch via RoCC counter reads; off by default so
+# production builds don't pay the overhead. Diagnostic only.
+# Configure with -DMERLIN_GEMMINI_COUNTERS=ON.
+option(MERLIN_GEMMINI_COUNTERS
+  "Enable per-dispatch Gemmini hardware counter sampling" OFF)
+
+# Opt-in dispatch-level debug: per-workgroup printouts, binding content
+# dumps, Bug A bprobe/mtrace machinery. Compile-time gated so production
+# builds carry zero overhead and emit nothing to UART. Configure with
+# -DMERLIN_DISPATCH_DEBUG=ON. The runtime globals
+# `iree_merlin_dispatch_debug_enabled` and
+# `iree_merlin_binding_debug_enabled` still gate emission at runtime
+# when the macro is on (set them from the harness before warm-up).
+option(MERLIN_DISPATCH_DEBUG
+  "Enable verbose per-dispatch debug printouts (UART-heavy)" OFF)
+
+set(_merlin_loader_defines
+  "IREE_HAVE_HAL_EXECUTABLE_LOADER_EMBEDDED_ELF=1"
+  "MERLIN_PROFILE_CYCLES=1")
+if(MERLIN_GEMMINI_COUNTERS)
+  list(APPEND _merlin_loader_defines "MERLIN_PROFILE_COUNTERS=1")
+endif()
+if(MERLIN_DISPATCH_DEBUG)
+  list(APPEND _merlin_loader_defines "MERLIN_DISPATCH_DEBUG=1")
+endif()
+
 iree_cc_library(
   NAME
     embedded_elf_loader
@@ -29,7 +56,7 @@ iree_cc_library(
     iree::hal::local::executable_loader
     iree::hal::local::executable_plugin_manager
   DEFINES
-    "IREE_HAVE_HAL_EXECUTABLE_LOADER_EMBEDDED_ELF=1"
+    ${_merlin_loader_defines}
   PUBLIC
 )
 
