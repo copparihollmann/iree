@@ -23,6 +23,7 @@ iree_cc_library(
     "ConfigureExecutables.cpp"
     "ConvertToHAL.cpp"
     "DumpExecutableBenchmarks.cpp"
+    "DumpExecutableDispatchModules.cpp"
     "DumpExecutableSources.cpp"
     "ElideRedundantCommands.cpp"
     "HoistExecutableObjects.cpp"

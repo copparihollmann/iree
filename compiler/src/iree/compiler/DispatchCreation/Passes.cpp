@@ -347,6 +347,19 @@ void buildDispatchCreationPassPipeline(
   addDispatchRegionCreationPreprocessingPasses(passManager, transformOptions);
   addDispatchRegionCreationPasses(passManager, transformOptions);
 
+  // Stamp a stable iree.dispatch_id on every flow.dispatch.region. This must
+  // happen after region formation (so all regions exist) and before workgroups
+  // conversion (so the attribute can be propagated onto the workgroups op by
+  // ConvertDispatchRegionsToWorkgroupsPass).
+  passManager.addPass(DispatchCreation::createTagDispatchIdsPass());
+
+  // Apply split/grow schedule directives on the freshly-tagged regions. New
+  // regions produced by `split` inherit the parent's iree.dispatch_id plus a
+  // 0/1 `iree.dispatch_subid`. Affinity directives flow later (post-
+  // workgroups). No-op when --iree-merlin-schedule-spec is unset.
+  FunctionLikeNest(passManager)
+      .addPass(DispatchCreation::createApplyScheduleDirectivesPass);
+
   FunctionLikeNest(passManager)
       .addPass(DispatchCreation::createConvertDispatchRegionsToWorkgroupsPass)
       // Convert tensor operations to flow.tensor ops.
@@ -375,6 +388,13 @@ void buildDispatchCreationPassPipeline(
       .addPass(DispatchCreation::createBitcastUnsupportedElementTypesPass)
       .addPass(createCSEPass)
       .addPass(IREE::Flow::createCanonicalizePass);
+
+  // Apply XPU-RT affinity directives. Runs at the very end of dispatch
+  // creation so that `stream.affinity` lands on `flow.dispatch.workgroups` ops
+  // (which carry the `iree.dispatch_id` propagated by
+  // ConvertDispatchRegionsToWorkgroupsPass). No-op when
+  // --iree-merlin-schedule-spec is unset.
+  passManager.addPass(DispatchCreation::createApplyAffinityDirectivesPass());
 }
 
 namespace {

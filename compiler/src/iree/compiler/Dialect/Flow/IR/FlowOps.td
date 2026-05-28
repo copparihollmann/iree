@@ -1388,6 +1388,85 @@ def FLOW_TensorBarrierOp : FLOW_PureOp<"tensor.barrier", [
   let hasCanonicalizer = 1;
 }
 
+def FLOW_TensorGatherFromDevicesOp : FLOW_PureOp<"tensor.gather_from_devices", [
+  AttrSizedOperandSegments,
+  Util_ShapeAwareOp,
+]> {
+  let summary = [{Gathers tensor shards from N devices and reduces them on a target device.}];
+  let description = [{
+    Materializes one logical tensor by collecting per-device shards from a
+    set of source devices and (optionally) reducing them on a target device.
+    Each `shards[i]` lives on `on_devices[i]` (each entry an `#hal.device.affinity` /
+    `#hal.device.promise` attribute); after lowering all shards are
+    transferred onto `to_device` and combined via the reduction kind:
+
+      reduction = "none": parallel-axis shard, the shards each cover a
+        distinct slice and the recombination is `tensor.insert_slice` per
+        shard. Only legal when the apply-shard pass has already emitted
+        per-shard slices.
+      reduction = "add" | "max" | "any": reduction-axis shard. After
+        transfer the shards are combined via `linalg.generic` (add / max
+        / any-elementwise) on `to_device`.
+
+    Lowering happens in FlowToStream: the op expands to N
+    `stream.async.transfer` ops onto `to_device` followed by either
+    `tensor.insert_slice` chain (none) or a `linalg.generic` reducer
+    (add/max/any).
+
+    This is the forward-compatible anchor for a future HAL collective op:
+    a peephole at the Stream layer can recognize `gather_from_devices` +
+    matching reduction and rewrite to a single `hal.fence`-coordinated
+    collective without touching the producer or consumer.
+  }];
+
+  let arguments = (ins
+    Variadic<FLOW_Tensor>:$shards,
+    FLOW_ShapeDynamicDims:$shard_dims,
+    TypedArrayAttrBase<AnyAttr, "device affinities">:$on_devices,
+    AnyAttr:$to_device,
+    StrAttr:$reduction
+  );
+  let results = (outs
+    FLOW_Tensor:$result
+  );
+
+  // We use the explicit `functional-type` form so each shard's type is
+  // printed alongside the result type, even though by convention all
+  // shards share a single tensor type. TableGen can't otherwise infer the
+  // variadic operand types from the result's single type.
+  let assemblyFormat = [{
+    $shards (`{` $shard_dims^ `}`)?
+    `on` $on_devices
+    `to` $to_device
+    `reduction` `=` $reduction
+    attr-dict-with-keyword
+    `:` functional-type($shards, $result)
+  }];
+
+  // With AttrSizedOperandSegments + a single result type the auto-
+  // generated builders work. Adding one convenience overload that takes a
+  // `StringRef` for the reduction (which the apply-shard pass uses).
+  let builders = [
+    OpBuilder<(ins "::mlir::Type":$resultType,
+                   "::mlir::ValueRange":$shards,
+                   "::mlir::ValueRange":$shardDims,
+                   "::mlir::ArrayAttr":$onDevices,
+                   "::mlir::Attribute":$toDevice,
+                   "::llvm::StringRef":$reduction),
+    [{
+      build($_builder, $_state, resultType, shards, shardDims, onDevices,
+            toDevice, $_builder.getStringAttr(reduction));
+    }]>,
+  ];
+
+  let extraClassDeclaration = [{
+    ValueRange getOperandDynamicDims(unsigned idx) { return getShardDims(); }
+    ValueRange getResultDynamicDims(unsigned idx) { return getShardDims(); }
+  }];
+
+  let hasVerifier = 1;
+}
+
 def FLOW_TensorTransferOp : FLOW_PureOp<"tensor.transfer", [
   AllTypesMatch<["operand", "result"]>,
   DeclareOpInterfaceMethods<Util_HoistableOpInterface>,

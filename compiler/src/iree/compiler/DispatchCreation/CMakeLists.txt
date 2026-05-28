@@ -16,8 +16,11 @@ iree_cc_library(
   HDRS
     "FusionUtils.h"
     "Passes.h"
+    "ScheduleSpec.h"
   SRCS
     "AnnotateDataTilingHints.cpp"
+    "ApplyAffinityDirectives.cpp"
+    "ApplyScheduleDirectives.cpp"
     "BitcastUnsupportedElementTypes.cpp"
     "BubbleUpExpandShapes.cpp"
     "CloneProducersIntoDispatchRegions.cpp"
@@ -39,6 +42,7 @@ iree_cc_library(
     "HoistEncodingOps.cpp"
     "HoistUniformScalarCompute.cpp"
     "InsertTensorBarriers.cpp"
+    "LowerGatherFromDevices.cpp"
     "MaterializeDefaultWorkgroupCountRegion.cpp"
     "Passes.cpp"
     "PropagateEncodings.cpp"
@@ -46,7 +50,9 @@ iree_cc_library(
     "SetEncoding.cpp"
     "SetSplitReductionSizes.cpp"
     "SinkReshapes.cpp"
+    "ScheduleSpec.cpp"
     "SplitReduction.cpp"
+    "TagDispatchIds.cpp"
     "TensorPadToTensorInsertSlice.cpp"
     "TransposeGenericOps.cpp"
   DEPS
@@ -57,6 +63,7 @@ iree_cc_library(
     MLIRAffineUtils
     MLIRAnalysis
     MLIRArithDialect
+    MLIRAsmParser
     MLIRArithUtils
     MLIRDestinationStyleOpInterface
     MLIRFuncDialect
@@ -86,6 +93,7 @@ iree_cc_library(
     iree::compiler::Dialect::Flow::Conversion::TensorToFlow
     iree::compiler::Dialect::Flow::IR
     iree::compiler::Dialect::Flow::Transforms
+    iree::compiler::Dialect::HAL::IR
     iree::compiler::Dialect::LinalgExt::IR
     iree::compiler::Dialect::LinalgExt::Transforms
     iree::compiler::Dialect::LinalgExt::Utils

@@ -407,6 +407,106 @@ def AnnotateDataTilingHintsPass :
   }];
 }
 
+def ApplyScheduleDirectivesPass :
+    InterfacePass<"iree-dispatch-creation-apply-schedule-directives",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Apply split/grow schedule directives to dispatch regions.";
+  let description = [{
+    Reads the path supplied via `--iree-merlin-schedule-spec` and rewrites
+    `flow.dispatch.region` ops keyed by `iree.dispatch_id`:
+
+    - `split: factor=N, axis=A`: hoist the root linalg op out of its region,
+      apply `linalg::splitOp` along the named axis at the midpoint, and wrap
+      each half in a fresh dispatch region carrying the original
+      `iree.dispatch_id` plus a 0/1 `iree.dispatch_subid`.
+    - `grow: merge_with=ID`: inline the producer region's body into the
+      consumer and erase the producer. Refuses if the producer has
+      uses outside the consumer.
+
+    `affinity` directives are handled later by
+    `apply-affinity-directives` (which runs on workgroups). `shard` and
+    `replicate` are not yet implemented; the pass emits a warning and
+    leaves those dispatches alone.
+  }];
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect",
+    "IREE::Flow::FlowDialect",
+    "IREE::HAL::HALDialect",
+  ];
+}
+
+def ApplyAffinityDirectivesPass :
+    Pass<"iree-dispatch-creation-apply-affinity-directives", "mlir::ModuleOp"> {
+  let summary = "Apply schedule.json affinity directives to dispatch workgroups.";
+  let description = [{
+    Reads the path supplied via `--iree-merlin-schedule-spec` and stamps
+    `stream.affinity = #hal.device.affinity<@<device>>` onto every
+    `flow.dispatch.workgroups` op according to the directives keyed by
+    `iree.dispatch_id`. Dispatches not named in the schedule receive the
+    `global.default_affinity` (if set). This is the compiler-side replacement
+    for the regex-based `samples/research/promise_schedule_multi_model/`
+    `hw_annotation.py`.
+  }];
+  let dependentDialects = [
+    "IREE::Flow::FlowDialect",
+    "IREE::HAL::HALDialect",
+  ];
+}
+
+def LowerGatherFromDevicesPass :
+    InterfacePass<"iree-dispatch-creation-lower-gather-from-devices",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Lower flow.tensor.gather_from_devices to existing Flow ops.";
+  let description = [{
+    Rewrites every `flow.tensor.gather_from_devices` op (emitted by
+    `apply-schedule-directives` for the `shard` directive) into existing
+    Flow + tensor + linalg ops so the standard FlowToStream conversion
+    pipeline can handle it without a bespoke pattern:
+
+      reduction = "none": one `flow.tensor.transfer` per shard onto the
+        home device, then a chain of `tensor.insert_slice` (the apply-shard
+        pass already emits per-shard slices, so each shard contributes a
+        disjoint region of the output).
+
+      reduction = "add" | "max" | "any": one `flow.tensor.transfer` per
+        shard onto the home device, then a chain of `linalg.generic`
+        elementwise reducers (one per non-base shard).
+
+    This is forward-compatible with a future Stream-level peephole that
+    matches `gather_from_devices` directly and lowers to a HAL collective
+    op (`hal.fence`-coordinated all_reduce); the peephole would simply
+    run before this pass.
+  }];
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect",
+    "IREE::Flow::FlowDialect",
+    "IREE::HAL::HALDialect",
+  ];
+}
+
+def TagDispatchIdsPass :
+    Pass<"iree-dispatch-creation-tag-dispatch-ids", "mlir::ModuleOp"> {
+  let summary = "Stamp a stable iree.dispatch_id on every flow.dispatch.region.";
+  let description = [{
+    Walks the module in post-order and assigns a unique i64
+    `iree.dispatch_id` attribute to each `flow.dispatch.region` that does not
+    already carry one. The id is the anchor used by the XPU-RT scheduler and
+    the apply-schedule-directives pass to refer to a specific dispatch across
+    serialization boundaries and through later passes that may rename or clone
+    operations.
+
+    The pass is idempotent: existing ids are preserved, and new ids are
+    assigned starting from one past the current maximum.
+  }];
+  let dependentDialects = [
+    "IREE::Flow::FlowDialect",
+  ];
+}
+
 def SetEncodingPass : InterfacePass<"iree-dispatch-creation-set-encoding",
                                     "mlir::FunctionOpInterface"> {
   let summary = "Introduces tensor encoding for flow dispatch regions.";

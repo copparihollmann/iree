@@ -49,12 +49,26 @@ void ConvertDispatchRegionsToWorkgroupsPass::runOnOperation() {
 
   // Clone additional producers and rewrite to DispatchWorkgroupsOp.
   for (auto regionOp : regionOps) {
+    // Capture the dispatch-id anchor (if any) before the region is rewritten;
+    // the workgroups op produced by the conversion needs to carry it so that
+    // late passes (apply-affinity-directives, scheduler bookkeeping) can still
+    // resolve dispatches by id.
+    Attribute dispatchIdAttr = regionOp->getAttr("iree.dispatch_id");
+    Attribute dispatchSubIdAttr = regionOp->getAttr("iree.dispatch_subid");
+
     auto maybeWorkgroupOp =
         rewriteFlowDispatchRegionToFlowDispatchWorkgroups(regionOp, rewriter);
     if (failed(maybeWorkgroupOp)) {
       regionOp.emitError(
           "failed to convert dispatch.region op to dispatch.workgroup op");
       return signalPassFailure();
+    }
+    if (dispatchIdAttr) {
+      maybeWorkgroupOp.value()->setAttr("iree.dispatch_id", dispatchIdAttr);
+    }
+    if (dispatchSubIdAttr) {
+      maybeWorkgroupOp.value()->setAttr("iree.dispatch_subid",
+                                        dispatchSubIdAttr);
     }
   }
 }

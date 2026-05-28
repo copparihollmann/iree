@@ -406,6 +406,14 @@ void buildHALTransformPassPipeline(OpPassManager &passManager,
       passManager.addPass(IREE::HAL::createDumpExecutableBenchmarksPass(
           {targetOptions.executableBenchmarksPath}));
     }
+
+    // Dump per-dispatch func.func modules (sibling to the benchmark dump):
+    // one func per dispatch with !hal.buffer args + a manifest.json for
+    // downstream chaining tools.
+    if (!targetOptions.executableDispatchModulesPath.empty()) {
+      passManager.addPass(IREE::HAL::createDumpExecutableDispatchModulesPass(
+          {targetOptions.executableDispatchModulesPath}));
+    }
   }
 
   if (hooks.afterPhase) {

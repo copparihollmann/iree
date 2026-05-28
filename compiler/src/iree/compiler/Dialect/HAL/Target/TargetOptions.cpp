@@ -58,6 +58,9 @@ void TargetOptions::bindOptions(OptionsBinder &binder) {
         if (executableBenchmarksPath.empty()) {
           executableBenchmarksPath = path;
         }
+        if (executableDispatchModulesPath.empty()) {
+          executableDispatchModulesPath = path;
+        }
         if (executableIntermediatesPath.empty()) {
           executableIntermediatesPath = path;
         }
@@ -85,6 +88,15 @@ void TargetOptions::bindOptions(OptionsBinder &binder) {
       "iree-hal-dump-executable-benchmarks-to", executableBenchmarksPath,
       llvm::cl::desc("Path to write standalone hal.executable benchmarks into "
                      "(- for stdout)."),
+      llvm::cl::cat(halTargetOptionsCategory));
+
+  binder.opt<std::string>(
+      "iree-hal-dump-executable-dispatch-modules-to",
+      executableDispatchModulesPath,
+      llvm::cl::desc("Path to write per-dispatch func.func MLIR modules + "
+                     "manifest.json into (sibling to "
+                     "iree-hal-dump-executable-benchmarks-to). Each emitted "
+                     "func takes one !hal.buffer arg per dispatch binding."),
       llvm::cl::cat(halTargetOptionsCategory));
 
   binder.opt<std::string>("iree-hal-dump-executable-intermediates-to",

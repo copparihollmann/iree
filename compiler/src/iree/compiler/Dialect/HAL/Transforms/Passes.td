@@ -747,6 +747,39 @@ def DumpExecutableBenchmarksPass :
   ];
 }
 
+def DumpExecutableDispatchModulesPass :
+    Pass<"iree-hal-dump-executable-dispatch-modules", "mlir::ModuleOp"> {
+  let summary = "Dumps one func.func per dispatch with !hal.buffer args.";
+  let description = [{
+    Sibling to --iree-hal-dump-executable-benchmarks. Instead of emitting a
+    benchmark wrapper that runs each dispatch in a synthetic batch loop with a
+    shared global buffer, this pass emits one `func.func` per (executable,
+    variant, export, workload) tuple where each binding is exposed as a
+    separate `!hal.buffer` argument. Output bindings are written in-place by
+    the dispatch; callers manage allocation and shape tracking via a sidecar
+    manifest.json that the pass also writes.
+
+    The emitted modules are intended for end-to-end chaining with real input
+    data flowing dispatch-to-dispatch (e.g., heterogeneous multi-target runs
+    where each dispatch may execute on a different device), so they avoid the
+    "synthetic uninitialized data" pitfall that makes the benchmark wrappers
+    unsuitable for correctness verification.
+  }];
+  let options = [
+    Option<
+      "path", "path",
+      "std::string", "",
+      "File system path to write each per-dispatch module + manifest.json."
+    >,
+  ];
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::func::FuncDialect",
+    "IREE::HAL::HALDialect",
+    "IREE::Util::UtilDialect",
+  ];
+}
+
 def StripExecutableContentsPass :
     Pass<"iree-hal-strip-executable-contents", "mlir::ModuleOp"> {
   let summary = "Strips executable module contents for reducing IR size during debugging.";

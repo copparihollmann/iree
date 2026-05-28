@@ -70,6 +70,10 @@ struct TargetOptions {
   // A path to write standalone executable benchmarks into.
   std::string executableBenchmarksPath;
 
+  // A path to write per-dispatch func.func modules (with !hal.buffer args) +
+  // manifest.json into. Sibling to executableBenchmarksPath.
+  std::string executableDispatchModulesPath;
+
   // A path to write executable intermediates into.
   std::string executableIntermediatesPath;
 

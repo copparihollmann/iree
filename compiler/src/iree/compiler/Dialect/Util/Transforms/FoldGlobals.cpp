@@ -243,6 +243,18 @@ static bool inlineConstantGlobalLoads(GlobalTable &globalTable) {
       return GlobalAction::PRESERVE;
     }
 
+    // Mirror the eraseUnusedGlobals carve-out for `!hal.device` so a
+    // schedule-spec pass that runs later can still find the prototype
+    // it needs to clone for @device_a/@device_b/@device_c globals.
+    {
+      std::string typeStr;
+      llvm::raw_string_ostream os(typeStr);
+      global.op.getGlobalType().print(os);
+      if (llvm::StringRef(os.str()) == "!hal.device") {
+        return GlobalAction::PRESERVE;
+      }
+    }
+
     // Inline initial value into all loads.
     auto inliningPolicy = global.op.getGlobalInliningPolicy();
     SmallVector<IREE::Util::GlobalLoadOpInterface> loadOps = global.loadOps;
@@ -287,6 +299,19 @@ static bool eraseUnusedGlobals(GlobalTable &globalTable) {
   return globalTable.forEach([&](Global &global) {
     if (!global.canDCE()) {
       return GlobalAction::PRESERVE;
+    }
+    // Preserve `!hal.device` globals even when nothing references them
+    // yet — they're declared by --iree-hal-target-device and may only
+    // get referenced by passes (e.g. ApplyAffinityDirectivesPass) that
+    // run AFTER global cleanup. Type-name check avoids a layering
+    // dependency on HAL from Util.
+    {
+      std::string typeStr;
+      llvm::raw_string_ostream os(typeStr);
+      global.op.getGlobalType().print(os);
+      if (llvm::StringRef(os.str()) == "!hal.device") {
+        return GlobalAction::PRESERVE;
+      }
     }
     if (global.loadOps.empty() && global.referencingOps.empty()) {
       // No loads; remove entirely.

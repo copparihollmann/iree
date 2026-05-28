@@ -1726,6 +1726,32 @@ SmallVector<int64_t> TensorBarrierOp::getTiedResultOperandIndices() {
 }
 
 //===----------------------------------------------------------------------===//
+// flow.tensor.gather_from_devices
+//===----------------------------------------------------------------------===//
+
+LogicalResult TensorGatherFromDevicesOp::verify() {
+  // Variadic shard count must match the on_devices array size.
+  if (getShards().size() != getOnDevices().size()) {
+    return emitOpError() << "expected " << getOnDevices().size()
+                         << " shards (one per on_devices entry), got "
+                         << getShards().size();
+  }
+  if (getShards().empty()) {
+    return emitOpError() << "expected at least one shard";
+  }
+  // All shards must already share the same tensor type (enforced by
+  // AllTypesMatch on the result + shards). Reduction kind validated by a
+  // small allowlist so unknown strings fail at parse time rather than
+  // silently in the lowering.
+  StringRef red = getReduction();
+  if (red != "none" && red != "add" && red != "max" && red != "any") {
+    return emitOpError() << "unknown reduction kind '" << red
+                         << "' (expected one of: none, add, max, any)";
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // flow.tensor.transfer
 //===----------------------------------------------------------------------===//
 

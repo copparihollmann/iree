@@ -147,43 +147,137 @@ IREE::transform_dialect::MatchCastCompatibleDagFromRootOp::matchOperation(
       return diag;
     }
 
-    for (auto [payloadOperand, targetOperand] :
-         llvm::zip_equal(payloadOp->getOperands(), targetOp->getOperands())) {
-      // If the target value is a block argument, map the payload value to the
-      // associated input and don't process its producer.
-      if (auto targetBlockArg = dyn_cast<BlockArgument>(targetOperand)) {
+    // Pair up a single (target, payload) value reference. Treats target
+    // block-args as match inputs; otherwise queues the producer pair onto
+    // the worklist (or verifies the existing mapping for already-seen
+    // producers). Returns true on success; on failure, populates *outErr
+    // and returns false.
+    auto enqueueValuePair = [&](Value targetVal, Value payloadVal,
+                                DiagnosedSilenceableFailure *outErr) -> bool {
+      if (auto targetBlockArg = dyn_cast<BlockArgument>(targetVal)) {
         if (targetBlockArg.getOwner() != &getRegion().front()) {
-          return emitDefiniteFailure() << "Invalid block argument in target";
+          *outErr =
+              emitDefiniteFailure() << "Invalid block argument in target";
+          return false;
         }
         int64_t argIdx = targetBlockArg.getArgNumber();
-        if (inputs[argIdx] && inputs[argIdx] != payloadOperand) {
-          return emitSilenceableError()
-                 << "input operand with conflicting uses";
+        if (inputs[argIdx] && inputs[argIdx] != payloadVal) {
+          *outErr = emitSilenceableError()
+                    << "input operand with conflicting uses";
+          return false;
         }
-        inputs[argIdx] = payloadOperand;
-        continue;
+        inputs[argIdx] = payloadVal;
+        return true;
       }
-
-      Operation *payloadDefiningOp = payloadOperand.getDefiningOp();
+      Operation *payloadDefiningOp = payloadVal.getDefiningOp();
       if (!payloadDefiningOp) {
-        return emitSilenceableError()
-               << "early termination of the operation dag";
+        *outErr = emitSilenceableError()
+                  << "early termination of the operation dag";
+        return false;
       }
-
-      // Check whether the producer was already processed, and if so make sure
-      // the target and payload match.
-      Operation *targetDefiningOp = targetOperand.getDefiningOp();
+      Operation *targetDefiningOp = targetVal.getDefiningOp();
       if (targetToPayloadMapping.contains(targetDefiningOp)) {
         if (targetToPayloadMapping.lookup(targetDefiningOp) !=
             payloadDefiningOp) {
-          return emitSilenceableError() << "dag mismatch";
+          *outErr = emitSilenceableError() << "dag mismatch";
+          return false;
         }
-        continue;
+        return true;
       }
-
-      // Pop the producer of this value onto the worklist.
       targetWorklist.push_back(targetDefiningOp);
       payloadWorklist.push_back(payloadDefiningOp);
+      return true;
+    };
+
+    for (auto [payloadOperand, targetOperand] :
+         llvm::zip_equal(payloadOp->getOperands(), targetOp->getOperands())) {
+      DiagnosedSilenceableFailure err =
+          DiagnosedSilenceableFailure::success();
+      if (!enqueueValuePair(targetOperand, payloadOperand, &err)) {
+        return err;
+      }
+    }
+
+    // Also walk references *captured into this op's regions* from outer
+    // scope. Without this, a linalg.generic body that references a
+    // hoisted constant defined in the match's outer scope would never
+    // visit that constant — step 2's region-equivalence walk would then
+    // hit `parentMapping.lookup(captured)` on an unmapped value and
+    // assert in IRMapping. Concretely: the post-canonicalize relu form
+    // `linalg.generic { ^bb0(%a, %o): arith.maximumf %a, %cst_outer }`
+    // captures `%cst_outer` from the surrounding region.
+    //
+    // Capture detection: an SSA Value is "captured" if its defining op
+    // (or block) lives outside this op's regions. We walk the regions
+    // and, for each operand of every contained op, check whether the
+    // operand's owner is inside the same op or further out. We pair the
+    // captured payload value with the corresponding capture in the
+    // target op via a synchronized walk — both target and payload must
+    // walk in lockstep so capture order matches deterministically.
+    if (targetOp->getNumRegions() == payloadOp->getNumRegions()) {
+      for (auto [targetRegion, payloadRegion] :
+           llvm::zip_equal(targetOp->getRegions(), payloadOp->getRegions())) {
+        SmallVector<Value> targetCaptures;
+        SmallVector<Value> payloadCaptures;
+        // Collect captures in deterministic order: walk every operation
+        // inside the region and inspect each operand. If the operand's
+        // defining op (or block) is OUTSIDE the region, it's a capture.
+        // We collect deduped captures preserving first-use order.
+        llvm::SmallSetVector<Value, 8> targetSeen;
+        llvm::SmallSetVector<Value, 8> payloadSeen;
+        targetRegion.walk([&](Operation *innerOp) {
+          for (Value v : innerOp->getOperands()) {
+            // Skip values defined inside this region.
+            Block *ownerBlock = nullptr;
+            if (auto ba = dyn_cast<BlockArgument>(v)) {
+              ownerBlock = ba.getOwner();
+            } else if (auto *op = v.getDefiningOp()) {
+              ownerBlock = op->getBlock();
+            }
+            if (!ownerBlock) continue;
+            // If owner block is contained in this region, it's not
+            // captured.
+            bool inside = false;
+            for (Block &b : targetRegion) {
+              if (&b == ownerBlock) { inside = true; break; }
+            }
+            if (inside) continue;
+            targetSeen.insert(v);
+          }
+        });
+        payloadRegion.walk([&](Operation *innerOp) {
+          for (Value v : innerOp->getOperands()) {
+            Block *ownerBlock = nullptr;
+            if (auto ba = dyn_cast<BlockArgument>(v)) {
+              ownerBlock = ba.getOwner();
+            } else if (auto *op = v.getDefiningOp()) {
+              ownerBlock = op->getBlock();
+            }
+            if (!ownerBlock) continue;
+            bool inside = false;
+            for (Block &b : payloadRegion) {
+              if (&b == ownerBlock) { inside = true; break; }
+            }
+            if (inside) continue;
+            payloadSeen.insert(v);
+          }
+        });
+        if (targetSeen.size() != payloadSeen.size()) {
+          return emitSilenceableError()
+                 << "captured-value count mismatch (target="
+                 << targetSeen.size() << ", payload=" << payloadSeen.size()
+                 << ")";
+        }
+        for (auto [t, p] :
+             llvm::zip_equal(targetSeen.getArrayRef(),
+                             payloadSeen.getArrayRef())) {
+          DiagnosedSilenceableFailure err =
+              DiagnosedSilenceableFailure::success();
+          if (!enqueueValuePair(t, p, &err)) {
+            return err;
+          }
+        }
+      }
     }
 
     // Mark the current target + payload as processed.
